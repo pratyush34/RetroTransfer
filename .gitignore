@@ -1,0 +1,7 @@
+build/
+build-mingw/
+build-ucrt64/
+*.exe
+*.json
+collection/
+.vscode/
