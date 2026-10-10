@@ -7,7 +7,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 include_directories(include)
 
+set(RETRO_CORE_SOURCES
+    src/scanner.cpp
+    src/fingerprint.cpp
+    src/fixed_chunker.cpp
+    src/cdc_chunker.cpp
+    src/adaptive_policy.cpp
+    src/chunk_engine.cpp
+)
+
 add_executable(RetroTransfer 
     src/main.cpp 
-    src/scanner.cpp
+    ${RETRO_CORE_SOURCES}
 )
+
+enable_testing()
+
+add_executable(test_chunking
+    tests/test_chunking.cpp
+    ${RETRO_CORE_SOURCES}
+)
+
+add_test(NAME ChunkingEngineTests COMMAND test_chunking)
