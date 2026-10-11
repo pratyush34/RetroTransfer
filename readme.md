@@ -40,7 +40,7 @@ Each saved JSON file contains a directory tree. Every directory has `name`, `pat
 
 **RetroTransfer** is an incremental project-transfer system designed to transfer software repositories and evolving directories over high-latency or constrained network links with minimal redundant data transmission.
 
-Traditional transfer tools either retransmit modified files entirely or compute expensive byte-level delta diffs in memory. RetroTransfer solves this by breaking files into discrete, fingerprinted chunks, identifying reusable content across revisions, compressing delta chunks, and streaming them across sockets.
+RetroTransfer is being developed to reduce retransmission of unchanged content across project revisions. This branch implements directory scanning, fixed and content-defined chunking, chunk fingerprints, metrics, and JSON manifests. Persistent deduplication, compression, socket transfer, and reconstruction are planned stages and are not implemented yet.
 
 ### System Pipeline Roadmap
 
@@ -63,7 +63,7 @@ flowchart LR
 
 ## 2. Chunking Engine Architecture
 
-The chunking engine processes files identified by `ProjectScanner` incrementally using bounded buffers, completely avoiding whole-file memory allocation.
+The chunkers process file payloads incrementally instead of loading each whole file into memory. Chunk metadata is retained in memory, so metadata use grows with the number of generated chunks.
 
 ```mermaid
 flowchart TD
@@ -116,6 +116,7 @@ Raw bytes can be retrieved on demand at any time using:
 - **Gear Hash Algorithm**:
   A 256-entry 64-bit lookup table `GEAR_MATRIX[256]` updates rolling state with 1 bitwise shift, 1 array lookup, and 1 integer addition per byte:
   $$\text{rolling\_hash} = (\text{rolling\_hash} \ll 1) + \text{GEAR\_MATRIX}[\text{byte}]$$
+- The lookup table is generated deterministically from a fixed seed so the same data and configuration produce the same boundaries across runs. The previous table in this branch contained only odd values, making the low-bit-zero boundary condition impossible; the corrected table changes CDC boundaries compared with old manifests. Regenerate old chunk manifests before comparing runs across this fix.
 - **Boundary Detection Rules**:
   1. *Minimum Chunk Constraint*: No boundary is evaluated while chunk size $< \text{minChunkSize}$ (default: 16 KiB).
   2. *Content Boundary*: For chunk size $\ge \text{minChunkSize}$, a boundary is declared when:
@@ -123,7 +124,7 @@ Raw bytes can be retrieved on demand at any time using:
      Where $\text{mask} = 2^k - 1$ produces an expected average chunk size of $2^k \approx \text{targetChunkSize}$ (default: 64 KiB).
   3. *Maximum Chunk Constraint*: If chunk size reaches $\text{maxChunkSize}$ (default: 256 KiB) without triggering a content boundary, a hard boundary cut is forced.
   4. *Stream Termination*: Remaining bytes at EOF form the final partial chunk.
-- **Advantage**: If a developer inserts one line at the top of a 5,000-line source file, Fixed chunking shifts all subsequent boundaries (invalidating all hashes), whereas CDC isolates the change to just 1 or 2 chunks!
+- **Advantage**: CDC can preserve boundaries after localized insertions or deletions, improving reuse compared with fixed offsets. The actual reuse rate depends on the input data and chunk parameters; it is not guaranteed to be limited to 1 or 2 chunks.
 
 ---
 
@@ -132,11 +133,11 @@ Raw bytes can be retrieved on demand at any time using:
 - **MurmurHash3_x64_128**:
   - Implements Austin Appleby's reference algorithm for 128-bit non-cryptographic hashing.
   - Formatted as a deterministic 32-character lowercase hexadecimal string.
-  - Highly optimized avalanche properties, uniform bit distribution, and high throughput (> 1.5 GB/s).
+  - High-throughput non-cryptographic hashing. Actual throughput depends on hardware, compiler, and input size.
   - Handles arbitrary binary streams and embedded null bytes correctly.
 - **Collision Safety**:
-  - While 128-bit collision probability is infinitesimal ($< 10^{-38}$), non-cryptographic hashes are not security guarantees.
-  - RetroTransfer separates identity from storage: downstream deduplication includes `readChunkPayload` byte-by-byte verification before discarding candidates.
+  - MurmurHash3 is non-cryptographic, so its fingerprint must not be treated as a security guarantee.
+  - `readChunkPayload` can reread bytes for comparison, but the deduplication/transfer engine is not implemented yet. `compareVersions` currently compares fingerprints only; do not use its matches as a collision-proof transfer decision.
 - **CRC32 Checksum**:
   - Standard IEEE 802.3 CRC32 polynomial (`0xEDB88320`) computed for every chunk to detect transport bit corruption.
 
@@ -148,8 +149,8 @@ Rather than naively applying CDC or Fixed chunking uniformly across all files, R
 
 | File Category | Criteria | Chosen Strategy | Algorithmic Rationale |
 | :--- | :--- | :--- | :--- |
-| **Sub-threshold Files** | Size $\le \text{minChunkSize}$ (16 KiB) | **Fixed** | CDC cannot subdivide below minimum size; a single fixed chunk avoids rolling-hash CPU overhead while producing identical minimal metadata. |
-| **Pre-compressed / Media** | `.zip`, `.gz`, `.png`, `.jpg`, `.mp4`, `.pdf`, `.7z` | **Fixed** | High-entropy compressed streams exhibit bit diffusion; localized source edits do not align with CDC boundaries; fixed chunking yields 3–5x higher throughput. |
+| **Sub-threshold Files** | Size $\le \text{minChunkSize}$ (16 KiB) | **Fixed** | CDC cannot create an earlier boundary below the minimum; fixed chunking avoids rolling-hash work. With default settings, these files usually fit in one fixed chunk. |
+| **Pre-compressed / Media** | `.zip`, `.gz`, `.png`, `.jpg`, `.mp4`, `.pdf`, `.7z` | **Fixed** | These formats often have high entropy; fixed chunking avoids the rolling-hash work. Actual throughput depends on the input and runtime environment. |
 | **Source Code & Text** | `.cpp`, `.h`, `.py`, `.java`, `.js`, `.json`, `.md` | **CDC** | Project source files frequently experience localized line insertions and deletions; CDC prevents cascading boundary shifts across subsequent lines. |
 | **Large General Data** | Size $> \text{minChunkSize}$ | **CDC** | Content-defined boundaries maximize deduplication resilience across version evolutions. |
 | **Explicit CLI Override** | User passes `--strategy fixed` or `--strategy cdc` | **Override** | Direct user instruction unconditionally overrides heuristic decisions. |
@@ -160,7 +161,7 @@ Every file decision records its rationale string in the JSON manifest for audita
 
 ## 7. CLI Usage & Options
 
-RetroTransfer preserves 100% backward compatibility with existing command syntax:
+The command syntax supports the established positional arguments and strategy options:
 
 ```bash
 # Basic scan + default adaptive chunking
@@ -181,11 +182,13 @@ RetroTransfer preserves 100% backward compatibility with existing command syntax
 ./RetroTransfer --help
 ```
 
+Chunk-size arguments must be positive integers no larger than 1 GiB. Invalid or inconsistent sizes are rejected before scanning.
+
 ---
 
 ## 8. Automated Testing
 
-RetroTransfer includes a dedicated CTest suite covering 20 edge cases:
+RetroTransfer includes a dedicated CTest suite covering 23 edge cases:
 
 ```bash
 ctest --test-dir build --output-on-failure
@@ -202,7 +205,7 @@ ctest --test-dir build --output-on-failure
 6. `test_not_divisible_by_chunk_size` (accurate partial last chunk)
 7. `test_binary_data_embedded_nulls` (binary safety, embedded 0x00)
 8. `test_identical_files_produce_identical_fingerprints` (determinism)
-9. `test_changed_contents_produce_different_fingerprints` (1-bit avalanche test)
+9. `test_changed_contents_produce_different_fingerprints` (checks that modified content changes the fingerprint)
 10. `test_correct_offsets_and_lengths` (accurate offset summation and byte reread)
 11. `test_cdc_min_chunk_size_behavior` (no chunk $< \text{minChunkSize}$ except EOF)
 12. `test_cdc_max_chunk_size_behavior` (no chunk $> \text{maxChunkSize}$)
@@ -212,14 +215,17 @@ ctest --test-dir build --output-on-failure
 16. `test_large_file_incremental` (1 MB streaming verification)
 17. `test_adaptive_mode_heuristics` (verifies rule tree for code, zip, and small files)
 18. `test_explicit_mode_overrides` (override flag verification)
-19. `test_collision_safe_content_verification` (byte-by-byte candidate comparison)
-20. `test_version_comparison_metrics` (reusable bytes & reuse ratio calculation)
+19. `test_cdc_content_boundaries_trigger` (ensures CDC finds content-defined cuts before max size and file/buffer paths agree)
+20. `test_scanner_skips_generated_dirs_and_symlinks` (avoids self-scanning generated data and symlink recursion)
+21. `test_payload_reread_and_byte_comparison` (rereads bytes and compares them directly)
+22. `test_version_comparison_metrics` (reusable bytes & reuse ratio calculation)
+23. `test_crc32_standard_vector` (validates the standard CRC32 result for `123456789`)
 
 ---
 
 ## 9. Benchmark & Example Results
 
-Running `./RetroTransfer . scan.json --benchmark` produces the following comparative baseline:
+Running `./RetroTransfer . scan.json --benchmark` prints a comparative summary. The following numbers are an illustrative example, not a performance guarantee; results depend on the project, hardware, and configuration:
 
 ```
 ============================================================

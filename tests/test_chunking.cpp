@@ -59,7 +59,7 @@ static fs::path createTestFile(const std::string& name, const std::vector<uint8_
     fs::path p = TEST_DIR / name;
     std::ofstream out(p, std::ios::binary);
     if (!data.empty()) {
-        out.write(reinterpret_cast<const char*>(data.data()), data.size());
+        out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     }
     out.close();
     return p;
@@ -210,6 +210,14 @@ static void test_binary_data_embedded_nulls() {
     TEST_ASSERT(reread == binData, "Reread data must exactly match binary original including nulls");
 }
 
+// CRC32 must match the standard IEEE 802.3 known-answer vector.
+static void test_crc32_standard_vector() {
+    const std::string sample = "123456789";
+    const uint32_t crc = compute_crc32(
+        reinterpret_cast<const uint8_t*>(sample.data()), sample.size());
+    TEST_ASSERT(crc == 0xCBF43926U, "CRC32 known-answer vector mismatch");
+}
+
 // 8. Identical files producing identical fingerprints
 static void test_identical_files_produce_identical_fingerprints() {
     std::vector<uint8_t> data(4096);
@@ -339,7 +347,72 @@ static void test_cdc_deterministic_output() {
     }
 }
 
-// 14. Invalid chunk sizes and configuration
+// 14. CDC must actually use content boundaries instead of always cutting at max size.
+static void test_cdc_content_boundaries_trigger() {
+    std::mt19937 rng(123456U);
+    std::vector<uint8_t> data(1024 * 1024);
+    for (auto& byte : data) {
+        byte = static_cast<uint8_t>(rng() & 0xFFU);
+    }
+
+    CDCConfig cfg(1024, 4096, 16384);
+    CDCChunker cdc(cfg);
+    std::vector<ChunkMetadata> chunks;
+    FileChunkMetrics metrics;
+    const bool ok = cdc.chunkBuffer(data.data(), data.size(), "random.bin", chunks, metrics);
+    TEST_ASSERT(ok, "CDC failed to chunk deterministic pseudo-random data");
+    TEST_ASSERT(chunks.size() > 1, "CDC should split a large input into multiple chunks");
+
+    bool foundContentBoundary = false;
+    uint64_t expectedOffset = 0;
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        TEST_ASSERT(chunks[i].offset == expectedOffset, "CDC chunk offsets must be contiguous");
+        TEST_ASSERT(chunks[i].length > 0 && chunks[i].length <= cfg.maxChunkSize,
+                    "CDC chunk size must be positive and no larger than maxChunkSize");
+        if (i + 1 < chunks.size() && chunks[i].length < cfg.maxChunkSize) {
+            foundContentBoundary = true;
+        }
+        expectedOffset += chunks[i].length;
+    }
+    TEST_ASSERT(expectedOffset == data.size(), "CDC chunks must cover all input bytes");
+    TEST_ASSERT(foundContentBoundary,
+                "CDC should find content-defined boundaries before hitting maxChunkSize");
+
+    const fs::path filePath = createTestFile("cdc_random_compare.bin", data);
+    std::vector<ChunkMetadata> fileChunks;
+    FileChunkMetrics fileMetrics;
+    CDCChunker tinyReadBufferCdc(cfg, 7);
+    const bool fileOk = tinyReadBufferCdc.chunkFile(filePath.string(), "random.bin", fileChunks, fileMetrics);
+    TEST_ASSERT(fileOk, "CDC file path failed on the same input with a tiny I/O buffer");
+    TEST_ASSERT(tinyReadBufferCdc.getIoBufferSize() == 7, "CDC I/O buffer size setting was not retained");
+    TEST_ASSERT(fileChunks.size() == chunks.size(), "CDC file and buffer paths must agree on chunk count");
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        TEST_ASSERT(fileChunks[i].offset == chunks[i].offset &&
+                    fileChunks[i].length == chunks[i].length &&
+                    fileChunks[i].fingerprint == chunks[i].fingerprint,
+                    "CDC file and buffer paths must produce matching metadata");
+    }
+}
+
+// 15. Scanner skips generated output and does not follow directory symlinks.
+static void test_scanner_skips_generated_dirs_and_symlinks() {
+    setupTestDir();
+    fs::create_directories(TEST_DIR / "collection");
+    createTestFileText("visible.txt", "scan me");
+    createTestFileText("collection/generated.json", "generated output");
+
+    std::error_code linkError;
+    const fs::path absoluteRoot = fs::absolute(TEST_DIR);
+    fs::create_directory_symlink(absoluteRoot, TEST_DIR / "cycle", linkError);
+
+    ProjectScanner scanner(TEST_DIR.string());
+    DirectoryNode root = scanner.scan();
+    TEST_ASSERT(root.files.size() == 1, "Scanner should include the visible file only");
+    TEST_ASSERT(root.files[0].fileName == "visible.txt", "Visible file missing from scan");
+    TEST_ASSERT(root.directories.empty(), "Generated collection and symlink directories should be skipped");
+}
+
+// 16. Invalid chunk sizes and configuration
 static void test_invalid_configurations() {
     FixedChunkConfig badFixed;
     badFixed.chunkSize = 0;
@@ -349,6 +422,13 @@ static void test_invalid_configurations() {
     FileChunkMetrics m;
     TEST_ASSERT(!fixed.chunkBuffer(nullptr, 0, "test", chunks, m), "Chunking with invalid config must fail");
 
+    FixedChunker validFixed;
+    TEST_ASSERT(!validFixed.chunkBuffer(nullptr, 1, "test", chunks, m),
+                "Fixed chunker must reject null input for non-empty data");
+    CDCChunker validCDC;
+    TEST_ASSERT(!validCDC.chunkBuffer(nullptr, 1, "test", chunks, m),
+                "CDC chunker must reject null input for non-empty data");
+
     CDCConfig badCDC1(0, 1024, 2048);
     TEST_ASSERT(!badCDC1.isValid(), "CDC min 0 must be invalid");
 
@@ -357,6 +437,22 @@ static void test_invalid_configurations() {
 
     CDCConfig badCDC3(512, 4096, 2048);
     TEST_ASSERT(!badCDC3.isValid(), "CDC target > max must be invalid");
+
+    CDCConfig modifiedAfterConstruction;
+    modifiedAfterConstruction.targetChunkSize = 1024;
+    CDCChunker recomputesMask(modifiedAfterConstruction);
+    TEST_ASSERT(recomputesMask.getConfig().mask == 1023,
+                "CDC chunker should recompute a stale mask from targetChunkSize");
+
+    FileChunkMetrics reusedMetrics;
+    reusedMetrics.fingerprintThroughputMBps = 999.0;
+    reusedMetrics.totalThroughputMBps = 999.0;
+    std::vector<ChunkMetadata> emptyChunks;
+    TEST_ASSERT(validFixed.chunkBuffer(nullptr, 0, "empty", emptyChunks, reusedMetrics),
+                "Fixed chunker should accept an empty null buffer");
+    TEST_ASSERT(reusedMetrics.fingerprintThroughputMBps == 0.0 &&
+                reusedMetrics.totalThroughputMBps == 0.0,
+                "Empty-input metrics must reset throughput instead of retaining stale values");
 }
 
 // 15. Missing or unreadable files
@@ -456,8 +552,8 @@ static void test_explicit_mode_overrides() {
     TEST_ASSERT(decOverrideCDC.wasOverridden, "wasOverridden flag should be true");
 }
 
-// 19. Collision safe handling / content verification
-static void test_collision_safe_content_verification() {
+// 21. Payload reread and direct byte comparison
+static void test_payload_reread_and_byte_comparison() {
     std::vector<uint8_t> dataA = {10, 20, 30, 40};
     std::vector<uint8_t> dataB = {10, 20, 30, 40};
     fs::path pA = createTestFile("verifA.bin", dataA);
@@ -475,7 +571,7 @@ static void test_collision_safe_content_verification() {
     TEST_ASSERT(readA == readB, "Byte-by-byte content verification succeeded");
 }
 
-// 20. Version comparison metrics
+// 22. Version comparison metrics
 static void test_version_comparison_metrics() {
     std::vector<ChunkMetadata> v1Chunks = {
         {"file.cpp", 0, 1000, "fp1", "cdc", 0, 0},
@@ -512,18 +608,21 @@ int main() {
     RUN_TEST(test_exactly_divisible_by_chunk_size);
     RUN_TEST(test_not_divisible_by_chunk_size);
     RUN_TEST(test_binary_data_embedded_nulls);
+    RUN_TEST(test_crc32_standard_vector);
     RUN_TEST(test_identical_files_produce_identical_fingerprints);
     RUN_TEST(test_changed_contents_produce_different_fingerprints);
     RUN_TEST(test_correct_offsets_and_lengths);
     RUN_TEST(test_cdc_min_chunk_size_behavior);
     RUN_TEST(test_cdc_max_chunk_size_behavior);
     RUN_TEST(test_cdc_deterministic_output);
+    RUN_TEST(test_cdc_content_boundaries_trigger);
+    RUN_TEST(test_scanner_skips_generated_dirs_and_symlinks);
     RUN_TEST(test_invalid_configurations);
     RUN_TEST(test_missing_unreadable_file);
     RUN_TEST(test_large_file_incremental);
     RUN_TEST(test_adaptive_mode_heuristics);
     RUN_TEST(test_explicit_mode_overrides);
-    RUN_TEST(test_collision_safe_content_verification);
+    RUN_TEST(test_payload_reread_and_byte_comparison);
     RUN_TEST(test_version_comparison_metrics);
 
     cleanupTestDir();

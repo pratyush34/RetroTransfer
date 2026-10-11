@@ -8,6 +8,10 @@
 /**
  * @brief Supported chunking strategies in RetroTransfer.
  */
+// Chunk payloads are held in memory for hashing. A hard upper bound prevents
+// accidental or malformed settings from requesting unbounded allocations.
+inline constexpr uint64_t kMaxChunkSizeBytes = 1024ULL * 1024ULL * 1024ULL;
+
 enum class ChunkStrategy {
     Fixed,      // Fixed-size chunking (baseline)
     CDC,        // Content-Defined Chunking (Gear rolling hash)
@@ -24,15 +28,21 @@ inline std::string strategy_to_string(ChunkStrategy strategy) {
 }
 
 inline bool string_to_strategy(const std::string& str, ChunkStrategy& outStrategy) {
-    if (str == "fixed" || str == "FIXED") {
+    std::string normalized = str;
+    for (char& character : normalized) {
+        if (character >= 'A' && character <= 'Z') {
+            character = static_cast<char>(character - 'A' + 'a');
+        }
+    }
+    if (normalized == "fixed") {
         outStrategy = ChunkStrategy::Fixed;
         return true;
     }
-    if (str == "cdc" || str == "CDC") {
+    if (normalized == "cdc") {
         outStrategy = ChunkStrategy::CDC;
         return true;
     }
-    if (str == "adaptive" || str == "ADAPTIVE") {
+    if (normalized == "adaptive") {
         outStrategy = ChunkStrategy::Adaptive;
         return true;
     }
@@ -46,7 +56,7 @@ struct FixedChunkConfig {
     size_t chunkSize = 64 * 1024; // Default: 64 KiB
 
     bool isValid() const {
-        return chunkSize > 0;
+        return chunkSize > 0 && chunkSize <= kMaxChunkSizeBytes;
     }
 };
 
@@ -77,22 +87,32 @@ struct CDCConfig {
             mask = 0;
             return;
         }
-        // Find power of 2 closest to targetChunkSize
+        // Choose the nearest power of two, capped at 2^32. The mask has k
+        // low bits set, giving a nominal boundary probability of 1 / 2^k.
         size_t bits = 0;
-        size_t val = targetChunkSize;
-        while (val > 1) {
-            val >>= 1;
-            bits++;
+        size_t value = targetChunkSize;
+        while (value > 1 && bits < 32) {
+            value >>= 1;
+            ++bits;
         }
-        if (bits > 32) bits = 32;
+        if (bits < 32) {
+            const uint64_t lower = 1ULL << bits;
+            const uint64_t upper = lower << 1;
+            const uint64_t target = static_cast<uint64_t>(targetChunkSize);
+            if (target - lower > upper - target) {
+                ++bits;
+            }
+        }
         if (bits < 4) bits = 4;
+        if (bits > 32) bits = 32;
         mask = (1ULL << bits) - 1ULL;
     }
 
     bool isValid() const {
         return minChunkSize > 0 &&
                minChunkSize <= targetChunkSize &&
-               targetChunkSize <= maxChunkSize;
+               targetChunkSize <= maxChunkSize &&
+               maxChunkSize <= kMaxChunkSizeBytes;
     }
 };
 

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <exception>
 
 FixedChunker::FixedChunker(const FixedChunkConfig& config)
     : config_(config) {
@@ -28,7 +29,13 @@ bool FixedChunker::chunkFile(const std::string& fullPath,
     auto totalStart = std::chrono::steady_clock::now();
     double totalFpDurationMs = 0.0;
 
-    std::vector<uint8_t> buffer(config_.chunkSize);
+    std::vector<uint8_t> buffer;
+    try {
+        buffer.resize(config_.chunkSize);
+    } catch (const std::exception& ex) {
+        std::cerr << "Error [FixedChunker]: Could not allocate chunk buffer: " << ex.what() << "\n";
+        return false;
+    }
     uint64_t currentOffset = 0;
     uint32_t sequence = 0;
     size_t minChunk = 0;
@@ -74,6 +81,13 @@ bool FixedChunker::chunkFile(const std::string& fullPath,
         outChunks.push_back(std::move(chunk));
     }
 
+    if (file.bad()) {
+        outChunks.resize(chunkCountBefore);
+        outMetrics = FileChunkMetrics{};
+        std::cerr << "Error [FixedChunker]: Read failure for file " << fullPath << "\n";
+        return false;
+    }
+
     auto totalEnd = std::chrono::steady_clock::now();
     double totalDurationMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
 
@@ -92,7 +106,7 @@ bool FixedChunker::chunkFile(const std::string& fullPath,
     outMetrics.totalDurationMs = totalDurationMs;
     outMetrics.minChunkSize = chunksGenerated > 0 ? minChunk : 0;
     outMetrics.maxChunkSize = chunksGenerated > 0 ? maxChunk : 0;
-    outMetrics.avgChunkSize = chunksGenerated > 0 ? static_cast<double>(totalBytes) / chunksGenerated : 0.0;
+    outMetrics.avgChunkSize = chunksGenerated > 0 ? static_cast<double>(totalBytes) / static_cast<double>(chunksGenerated) : 0.0;
 
     // Estimated metadata overhead: approx 128 bytes per chunk record
     outMetrics.estimatedMetadataBytes = chunksGenerated * (sizeof(ChunkMetadata) + relativePath.size() + 32);
@@ -119,6 +133,10 @@ bool FixedChunker::chunkBuffer(const uint8_t* buffer,
                                FileChunkMetrics& outMetrics) const {
     if (!config_.isValid()) {
         std::cerr << "Error [FixedChunker]: Invalid chunk size " << config_.chunkSize << "\n";
+        return false;
+    }
+    if (length > 0 && buffer == nullptr) {
+        std::cerr << "Error [FixedChunker]: Null input buffer for non-empty data\n";
         return false;
     }
 
@@ -180,14 +198,18 @@ bool FixedChunker::chunkBuffer(const uint8_t* buffer,
     outMetrics.totalDurationMs = totalDurationMs;
     outMetrics.minChunkSize = chunksGenerated > 0 ? minChunk : 0;
     outMetrics.maxChunkSize = chunksGenerated > 0 ? maxChunk : 0;
-    outMetrics.avgChunkSize = chunksGenerated > 0 ? static_cast<double>(length) / chunksGenerated : 0.0;
+    outMetrics.avgChunkSize = chunksGenerated > 0 ? static_cast<double>(length) / static_cast<double>(chunksGenerated) : 0.0;
     outMetrics.estimatedMetadataBytes = chunksGenerated * (sizeof(ChunkMetadata) + relativePath.size() + 32);
 
     if (totalFpDurationMs > 0.0) {
         outMetrics.fingerprintThroughputMBps = (static_cast<double>(length) / (1024.0 * 1024.0)) / (totalFpDurationMs / 1000.0);
+    } else {
+        outMetrics.fingerprintThroughputMBps = 0.0;
     }
     if (totalDurationMs > 0.0) {
         outMetrics.totalThroughputMBps = (static_cast<double>(length) / (1024.0 * 1024.0)) / (totalDurationMs / 1000.0);
+    } else {
+        outMetrics.totalThroughputMBps = 0.0;
     }
 
     return true;

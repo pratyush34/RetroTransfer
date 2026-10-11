@@ -5,31 +5,30 @@
 #include <filesystem>
 #include <string>
 #include <vector>
-using namespace std;
 
 struct FileInfo {
-    string fileName;
-    string filePath;
+    std::string fileName;
+    std::string filePath;
     uintmax_t fileSize;
-    string fileType;
+    std::string fileType;
     int64_t modificationTime;
 };
 
 struct DirectoryNode {
-    string directoryName;
-    string directoryPath;
-    vector<DirectoryNode> directories;
-    vector<FileInfo> files;
+    std::string directoryName;
+    std::string directoryPath;
+    std::vector<DirectoryNode> directories;
+    std::vector<FileInfo> files;
 };
 
 class ProjectScanner {
     private:
-    string root_path;
-    vector<string> ignored_folders;
-    vector<string> ignored_extensions;
+    std::string root_path;
+    std::vector<std::string> ignored_folders;
+    std::vector<std::string> ignored_extensions;
 
 public:
-    ProjectScanner(const string& path);
+    ProjectScanner(const std::string& path);
     DirectoryNode scan();
 };
 

@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 static inline uint64_t rotl64(uint64_t x, int8_t r) {
     return (x << r) | (x >> (64 - r));
@@ -31,6 +32,11 @@ std::string Fingerprint128::to_hex() const {
 }
 
 Fingerprint128 murmurhash3_128(const uint8_t* data, size_t len, uint32_t seed) {
+    // A null pointer is valid only for an empty input. Return a neutral value for
+    // invalid input instead of dereferencing it.
+    if (data == nullptr && len != 0) {
+        return {};
+    }
     const size_t nblocks = len / 16;
     uint64_t h1 = seed;
     uint64_t h2 = seed;
@@ -63,7 +69,7 @@ Fingerprint128 murmurhash3_128(const uint8_t* data, size_t len, uint32_t seed) {
     }
 
     // Tail: remaining 1..15 bytes
-    const uint8_t* tail = data + nblocks * 16;
+    const uint8_t* tail = data == nullptr ? nullptr : data + nblocks * 16;
     uint64_t k1 = 0;
     uint64_t k2 = 0;
 
@@ -121,7 +127,7 @@ std::string compute_fingerprint_hex(const uint8_t* data, size_t len, uint32_t se
 }
 
 static uint32_t crc32_table[256];
-static bool crc32_table_initialized = false;
+static std::once_flag crc32_table_once;
 
 static void init_crc32() {
     for (uint32_t i = 0; i < 256; ++i) {
@@ -135,13 +141,13 @@ static void init_crc32() {
         }
         crc32_table[i] = crc;
     }
-    crc32_table_initialized = true;
 }
 
 uint32_t compute_crc32(const uint8_t* data, size_t len) {
-    if (!crc32_table_initialized) {
-        init_crc32();
+    if (data == nullptr && len != 0) {
+        return 0;
     }
+    std::call_once(crc32_table_once, init_crc32);
     uint32_t crc = 0xFFFFFFFFU;
     for (size_t i = 0; i < len; ++i) {
         crc = (crc >> 8) ^ crc32_table[(crc ^ data[i]) & 0xFF];

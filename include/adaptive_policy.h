@@ -28,7 +28,7 @@ struct PolicyDecision {
  * between Fixed-size chunking and Content-Defined Chunking (CDC).
  * 
  * Transparent Heuristic Rules:
- * 1. Small files (<= min CDC chunk size): Single fixed chunk avoids rolling-hash CPU cost.
+ * 1. Small files (<= min CDC chunk size): Fixed chunking avoids rolling-hash CPU cost.
  * 2. Pre-compressed/media formats: Fixed chunking avoids useless boundary searches on high-entropy streams.
  * 3. Source code/text files: CDC isolates localized edits and prevents boundary shifts.
  * 4. General/unknown files: Configurable default (CDC for shift-resilience).

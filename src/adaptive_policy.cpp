@@ -74,7 +74,7 @@ PolicyDecision AdaptivePolicy::decide(const FileInfo& file,
         decision.reason = "File size (" + std::to_string(file.fileSize) + 
                           " B) <= CDC minimum chunk threshold (" + 
                           std::to_string(defaultCDC.minChunkSize) + 
-                          " B); single fixed-size chunk avoids rolling-hash CPU cost without metadata explosion.";
+                          " B); fixed chunking avoids rolling-hash CPU cost for small files.";
         return decision;
     }
 

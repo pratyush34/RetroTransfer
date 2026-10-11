@@ -33,7 +33,8 @@
  */
 class CDCChunker {
 public:
-    explicit CDCChunker(const CDCConfig& config = CDCConfig{});
+    explicit CDCChunker(const CDCConfig& config = CDCConfig{},
+                        size_t ioBufferSize = 64 * 1024);
 
     /**
      * @brief Chunks a file from disk incrementally.
@@ -59,10 +60,16 @@ public:
                      FileChunkMetrics& outMetrics) const;
 
     const CDCConfig& getConfig() const { return config_; }
-    void setConfig(const CDCConfig& config) { config_ = config; }
+    void setConfig(const CDCConfig& config) {
+        config_ = config;
+        config_.update_mask();
+    }
+    size_t getIoBufferSize() const { return ioBufferSize_; }
+    void setIoBufferSize(size_t size) { ioBufferSize_ = size; }
 
 private:
     CDCConfig config_;
+    size_t ioBufferSize_;
 };
 
 #endif // CDC_CHUNKER_H

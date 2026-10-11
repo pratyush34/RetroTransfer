@@ -6,6 +6,8 @@
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
+#include <cctype>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -13,27 +15,59 @@
 namespace fs = std::filesystem;
 
 static std::string jsonEscape(const std::string& value) {
+    static constexpr char HEX[] = "0123456789abcdef";
     std::string escaped;
-    for (char character : value) {
-        if (character == '\\' || character == '"') {
-            escaped += '\\';
-        } else if (character == '\n') {
-            escaped += "\\n";
-            continue;
-        } else if (character == '\r') {
-            escaped += "\\r";
-            continue;
-        } else if (character == '\t') {
-            escaped += "\\t";
-            continue;
+    escaped.reserve(value.size());
+    for (char rawCharacter : value) {
+        const auto character = static_cast<unsigned char>(rawCharacter);
+        switch (character) {
+            case '\\': escaped += "\\\\"; break;
+            case '"':  escaped += "\\\""; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (character < 0x20) {
+                    escaped += "\\u00";
+                    escaped += HEX[(character >> 4) & 0x0f];
+                    escaped += HEX[character & 0x0f];
+                } else {
+                    escaped += static_cast<char>(character);
+                }
         }
-        escaped += character;
     }
     return escaped;
 }
 
+static bool parseSizeArgument(const std::string& text, size_t& value) {
+    if (text.empty()) return false;
+    for (char rawCharacter : text) {
+        const auto character = static_cast<unsigned char>(rawCharacter);
+        if (!std::isdigit(character)) return false;
+    }
+    try {
+        const unsigned long long parsed = std::stoull(text);
+        if (parsed == 0 || parsed > static_cast<unsigned long long>(
+                std::numeric_limits<size_t>::max()) ||
+            parsed > static_cast<unsigned long long>(
+                std::numeric_limits<std::streamsize>::max())) {
+            return false;
+        }
+        // A chunk is held in memory while it is fingerprinted. Keep CLI settings
+        // bounded so a typo cannot request an effectively unbounded allocation.
+        constexpr unsigned long long MAX_CHUNK_BYTES = 1024ULL * 1024ULL * 1024ULL;
+        if (parsed > MAX_CHUNK_BYTES) return false;
+        value = static_cast<size_t>(parsed);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 static void writeIndent(std::ofstream& output, int depth) {
-    output << std::string(depth * 2, ' ');
+    output << std::string(static_cast<size_t>(depth * 2), ' ');
 }
 
 static void writeDirectory(std::ofstream& output, const DirectoryNode& directory, int depth) {
@@ -106,7 +140,7 @@ static void writeChunkManifestJson(std::ofstream& out,
         const auto& f = result.files[i];
         out << "    {\n";
         out << "      \"path\": \"" << jsonEscape(f.relativePath) << "\",\n";
-        out << "      \"size\": " << f.fileInfo.fileSize << ",\n";
+        out << "      \"size\": " << f.metrics.fileSize << ",\n";
         out << "      \"strategy\": \"" << f.metrics.selectedStrategy << "\",\n";
         out << "      \"reason\": \"" << jsonEscape(f.decision.reason) << "\",\n";
         out << "      \"chunkCount\": " << f.chunks.size() << ",\n";
@@ -146,14 +180,16 @@ static void printUsage(const char* progName) {
     std::cout << "  --strategy, -s <mode> Chunking strategy: \"adaptive\" (default), \"fixed\", or \"cdc\"\n";
     std::cout << "  --chunk-size <bytes>  Fixed chunk size in bytes (default: 65536)\n";
     std::cout << "  --min-chunk <bytes>   CDC minimum chunk size (default: 16384)\n";
-    std::cout << "  --target-chunk <bytes>CDC target chunk size (default: 65536)\n";
+    std::cout << "  --target-chunk <bytes> CDC target chunk size (default: 65536)\n";
     std::cout << "  --max-chunk <bytes>   CDC maximum chunk size (default: 262144)\n";
     std::cout << "  --benchmark           Run repeatable benchmark comparing Fixed, CDC, and Adaptive\n";
     std::cout << "  --no-chunk            Only perform project scan, skip chunking stage\n";
     std::cout << "  --help, -h            Show this help message\n";
 }
 
-static void runBenchmark(const DirectoryNode& directoryTree, const std::string& path) {
+static void runBenchmark(const DirectoryNode& directoryTree,
+                         const std::string& path,
+                         const EngineConfig& baseConfig) {
     std::cout << "\n============================================================\n";
     std::cout << "        RETROTRANSFER CHUNKING STRATEGY BENCHMARK           \n";
     std::cout << "============================================================\n";
@@ -180,7 +216,7 @@ static void runBenchmark(const DirectoryNode& directoryTree, const std::string& 
     std::vector<BenchRow> rows;
 
     for (auto strat : strategies) {
-        EngineConfig cfg;
+        EngineConfig cfg = baseConfig;
         cfg.strategy = strat;
         ChunkEngine engine(cfg);
 
@@ -227,16 +263,15 @@ static void runBenchmark(const DirectoryNode& directoryTree, const std::string& 
 int main(int argc, char* argv[]) {
     std::string path = ".";
     std::string outputName = "scan.json";
-    bool customOutputName = false;
     bool enableChunking = true;
     bool benchmarkMode = false;
 
     EngineConfig config;
 
-    // Parse command line arguments
+    // Parse command-line arguments and fail clearly on malformed values.
     int positionalIdx = 0;
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+        const std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
             return 0;
@@ -244,33 +279,68 @@ int main(int argc, char* argv[]) {
             enableChunking = false;
         } else if (arg == "--benchmark") {
             benchmarkMode = true;
-        } else if ((arg == "--strategy" || arg == "-s") && i + 1 < argc) {
-            std::string stratStr = argv[++i];
-            if (!string_to_strategy(stratStr, config.strategy)) {
-                std::cerr << "Warning: Unknown strategy '" << stratStr << "'. Using adaptive.\n";
+        } else if (arg == "--strategy" || arg == "-s") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a strategy value.\n";
+                return 2;
             }
-        } else if (arg == "--chunk-size" && i + 1 < argc) {
-            config.fixedConfig.chunkSize = std::stoull(argv[++i]);
-        } else if (arg == "--min-chunk" && i + 1 < argc) {
-            config.cdcConfig.minChunkSize = std::stoull(argv[++i]);
-            config.cdcConfig.update_mask();
-        } else if (arg == "--target-chunk" && i + 1 < argc) {
-            config.cdcConfig.targetChunkSize = std::stoull(argv[++i]);
-            config.cdcConfig.update_mask();
-        } else if (arg == "--max-chunk" && i + 1 < argc) {
-            config.cdcConfig.maxChunkSize = std::stoull(argv[++i]);
+            const std::string strategyText = argv[++i];
+            if (!string_to_strategy(strategyText, config.strategy)) {
+                std::cerr << "Error: Unknown strategy '" << strategyText
+                          << "'. Choose adaptive, fixed, or cdc.\n";
+                return 2;
+            }
+        } else if (arg == "--chunk-size" || arg == "--min-chunk" ||
+                   arg == "--target-chunk" || arg == "--max-chunk") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a positive byte count (max 1 GiB).\n";
+                return 2;
+            }
+            size_t parsed = 0;
+            const std::string valueText = argv[++i];
+            if (!parseSizeArgument(valueText, parsed)) {
+                std::cerr << "Error: Invalid value '" << valueText << "' for " << arg
+                          << ". Use a positive integer up to 1073741824 bytes.\n";
+                return 2;
+            }
+            if (arg == "--chunk-size") {
+                config.fixedConfig.chunkSize = parsed;
+            } else if (arg == "--min-chunk") {
+                config.cdcConfig.minChunkSize = parsed;
+                config.cdcConfig.update_mask();
+            } else if (arg == "--target-chunk") {
+                config.cdcConfig.targetChunkSize = parsed;
+                config.cdcConfig.update_mask();
+            } else {
+                config.cdcConfig.maxChunkSize = parsed;
+            }
         } else if (arg.rfind("--", 0) == 0) {
-            std::cerr << "Warning: Unrecognized option: " << arg << "\n";
+            std::cerr << "Error: Unrecognized option: " << arg << "\n";
+            return 2;
         } else {
             if (positionalIdx == 0) {
                 path = arg;
-                positionalIdx++;
+                ++positionalIdx;
             } else if (positionalIdx == 1) {
                 outputName = arg;
-                customOutputName = true;
-                positionalIdx++;
+                ++positionalIdx;
+            } else {
+                std::cerr << "Error: Unexpected positional argument: " << arg << "\n";
+                return 2;
             }
         }
+    }
+
+    if (!config.fixedConfig.isValid() || !config.cdcConfig.isValid()) {
+        std::cerr << "Error: Invalid chunk configuration. Require 0 < min <= target <= max; "
+                     "all sizes must be at most 1 GiB.\n";
+        return 2;
+    }
+
+    std::error_code rootError;
+    if (!fs::exists(path, rootError) || rootError || !fs::is_directory(path, rootError) || rootError) {
+        std::cerr << "Error: Scan root is not an accessible directory: " << path << "\n";
+        return 1;
     }
 
     const fs::path collectionFolder = "collection";
@@ -281,7 +351,13 @@ int main(int argc, char* argv[]) {
     ProjectScanner scanner(path);
     const DirectoryNode directoryTree = scanner.scan();
 
-    fs::create_directories(collectionFolder);
+    std::error_code outputDirError;
+    fs::create_directories(collectionFolder, outputDirError);
+    if (outputDirError) {
+        std::cerr << "Error: Could not create output directory " << collectionFolder
+                  << ": " << outputDirError.message() << "\n";
+        return 1;
+    }
     std::ofstream output(outputPath);
     if (!output) {
         std::cerr << "Error: Could not create output file: " << outputPath << "\n";
@@ -290,6 +366,11 @@ int main(int argc, char* argv[]) {
 
     writeDirectory(output, directoryTree, 0);
     output << "\n";
+    output.close();
+    if (!output) {
+        std::cerr << "Error: Failed while writing scan output: " << outputPath << "\n";
+        return 1;
+    }
     std::cout << "Saved scan data to " << outputPath << "\n";
 
     // 2. Chunking Engine Stage
@@ -304,16 +385,23 @@ int main(int argc, char* argv[]) {
         fs::path chunkOutFilename = outputPath.stem().string() + "_chunks.json";
         fs::path chunkOutputPath = collectionFolder / chunkOutFilename;
         std::ofstream chunkOut(chunkOutputPath);
-        if (chunkOut) {
-            writeChunkManifestJson(chunkOut, chunkResult, config, path);
-            std::cout << "Saved chunk manifest to " << chunkOutputPath << "\n";
+        if (!chunkOut) {
+            std::cerr << "Error: Could not create chunk manifest: " << chunkOutputPath << "\n";
+            return 1;
         }
+        writeChunkManifestJson(chunkOut, chunkResult, config, path);
+        chunkOut.close();
+        if (!chunkOut) {
+            std::cerr << "Error: Failed while writing chunk manifest: " << chunkOutputPath << "\n";
+            return 1;
+        }
+        std::cout << "Saved chunk manifest to " << chunkOutputPath << "\n";
 
         std::cout << "\n--- Chunking Engine Summary ---\n";
         std::cout << "Files processed    : " << chunkResult.metrics.totalFilesProcessed << "\n";
         std::cout << "Total bytes        : " << chunkResult.metrics.totalBytesProcessed << " bytes ("
                   << std::fixed << std::setprecision(2)
-                  << (chunkResult.metrics.totalBytesProcessed / (1024.0 * 1024.0)) << " MB)\n";
+                  << (static_cast<double>(chunkResult.metrics.totalBytesProcessed) / (1024.0 * 1024.0)) << " MB)\n";
         std::cout << "Chunks generated   : " << chunkResult.metrics.totalChunksGenerated << "\n";
         std::cout << "Unique fingerprints: " << chunkResult.metrics.uniqueFingerprints << "\n";
         std::cout << "Internal dedup bytes: " << chunkResult.metrics.deduplicatedBytes << " bytes ("
@@ -330,7 +418,7 @@ int main(int argc, char* argv[]) {
         std::cout << "--------------------------------\n";
 
         if (benchmarkMode) {
-            runBenchmark(directoryTree, path);
+            runBenchmark(directoryTree, path, config);
         }
     }
 

@@ -3,6 +3,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <exception>
 #include <iostream>
 #include <unordered_set>
 
@@ -44,7 +46,7 @@ bool ChunkEngine::processFile(const FileInfo& file,
         FixedChunker chunker(outResult.decision.fixedConfig);
         success = chunker.chunkFile(file.filePath, relativePath, outResult.chunks, outResult.metrics);
     } else {
-        CDCChunker chunker(outResult.decision.cdcConfig);
+        CDCChunker chunker(outResult.decision.cdcConfig, config_.ioBufferSize);
         success = chunker.chunkFile(file.filePath, relativePath, outResult.chunks, outResult.metrics);
     }
 
@@ -118,19 +120,40 @@ bool ChunkEngine::readChunkPayload(const std::string& fullPath,
                                   uint64_t offset,
                                   uint64_t length,
                                   std::vector<uint8_t>& outData) {
+    if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+        length > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        length > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max()) ||
+        length > kMaxChunkSizeBytes) {
+        outData.clear();
+        return false;
+    }
+
     std::ifstream file(fullPath, std::ios::binary);
     if (!file.is_open()) {
+        outData.clear();
         return false;
     }
 
     file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!file) {
+        outData.clear();
         return false;
     }
 
-    outData.resize(static_cast<size_t>(length));
+    try {
+        outData.resize(static_cast<size_t>(length));
+    } catch (const std::exception&) {
+        outData.clear();
+        return false;
+    }
+
+    if (length == 0) return true;
     file.read(reinterpret_cast<char*>(outData.data()), static_cast<std::streamsize>(length));
-    return static_cast<uint64_t>(file.gcount()) == length;
+    if (static_cast<uint64_t>(file.gcount()) != length || file.bad()) {
+        outData.clear();
+        return false;
+    }
+    return true;
 }
 
 VersionComparisonMetrics ChunkEngine::compareVersions(const std::vector<ChunkMetadata>& baseChunks,
