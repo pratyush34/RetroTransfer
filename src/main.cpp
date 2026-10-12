@@ -1,24 +1,76 @@
 #include "scanner.h"
+#include "chunk_engine.h"
+#include "chunk_config.h"
+
+#include <chrono>
 #include <fstream>
 #include <filesystem>
+#include <iomanip>
+#include <limits>
+#include <cctype>
 #include <iostream>
+#include <string>
+#include <vector>
 
-static string jsonEscape(const string& value) {
-    string escaped;
-    for (char character : value) {
-        if (character == '\\' || character == '"') {
-            escaped += '\\';
+namespace fs = std::filesystem;
+
+static std::string jsonEscape(const std::string& value) {
+    static constexpr char HEX[] = "0123456789abcdef";
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char rawCharacter : value) {
+        const auto character = static_cast<unsigned char>(rawCharacter);
+        switch (character) {
+            case '\\': escaped += "\\\\"; break;
+            case '"':  escaped += "\\\""; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (character < 0x20) {
+                    escaped += "\\u00";
+                    escaped += HEX[(character >> 4) & 0x0f];
+                    escaped += HEX[character & 0x0f];
+                } else {
+                    escaped += static_cast<char>(character);
+                }
         }
-        escaped += character;
     }
     return escaped;
 }
 
-static void writeIndent(ofstream& output, int depth) {
-    output << string(depth * 2, ' ');
+static bool parseSizeArgument(const std::string& text, size_t& value) {
+    if (text.empty()) return false;
+    for (char rawCharacter : text) {
+        const auto character = static_cast<unsigned char>(rawCharacter);
+        if (!std::isdigit(character)) return false;
+    }
+    try {
+        const unsigned long long parsed = std::stoull(text);
+        if (parsed == 0 || parsed > static_cast<unsigned long long>(
+                std::numeric_limits<size_t>::max()) ||
+            parsed > static_cast<unsigned long long>(
+                std::numeric_limits<std::streamsize>::max())) {
+            return false;
+        }
+        // A chunk is held in memory while it is fingerprinted. Keep CLI settings
+        // bounded so a typo cannot request an effectively unbounded allocation.
+        constexpr unsigned long long MAX_CHUNK_BYTES = 1024ULL * 1024ULL * 1024ULL;
+        if (parsed > MAX_CHUNK_BYTES) return false;
+        value = static_cast<size_t>(parsed);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
-static void writeDirectory(ofstream& output, const DirectoryNode& directory, int depth) {
+static void writeIndent(std::ofstream& output, int depth) {
+    output << std::string(static_cast<size_t>(depth * 2), ' ');
+}
+
+static void writeDirectory(std::ofstream& output, const DirectoryNode& directory, int depth) {
     writeIndent(output, depth);
     output << "{\n";
     writeIndent(output, depth + 1);
@@ -57,25 +109,318 @@ static void writeDirectory(ofstream& output, const DirectoryNode& directory, int
     output << "}";
 }
 
+static void writeChunkManifestJson(std::ofstream& out,
+                                   const ProjectChunkResult& result,
+                                   const EngineConfig& config,
+                                   const std::string& rootPath) {
+    out << "{\n";
+    out << "  \"rootPath\": \"" << jsonEscape(rootPath) << "\",\n";
+    out << "  \"selectedStrategy\": \"" << strategy_to_string(config.strategy) << "\",\n";
+    out << "  \"summary\": {\n";
+    out << "    \"totalFiles\": " << result.metrics.totalFilesProcessed << ",\n";
+    out << "    \"totalBytes\": " << result.metrics.totalBytesProcessed << ",\n";
+    out << "    \"totalChunks\": " << result.metrics.totalChunksGenerated << ",\n";
+    out << "    \"uniqueFingerprints\": " << result.metrics.uniqueFingerprints << ",\n";
+    out << "    \"deduplicatedBytes\": " << result.metrics.deduplicatedBytes << ",\n";
+    out << "    \"internalDedupRatio\": " << std::fixed << std::setprecision(4) 
+        << result.metrics.internalDedupRatio << ",\n";
+    out << "    \"totalChunkingTimeMs\": " << std::fixed << std::setprecision(2) 
+        << result.metrics.totalChunkingTimeMs << ",\n";
+    out << "    \"totalFingerprintingTimeMs\": " << std::fixed << std::setprecision(2) 
+        << result.metrics.totalFingerprintingTimeMs << ",\n";
+    out << "    \"totalExecutionTimeMs\": " << std::fixed << std::setprecision(2) 
+        << result.metrics.totalExecutionTimeMs << ",\n";
+    out << "    \"overallThroughputMBps\": " << std::fixed << std::setprecision(2) 
+        << result.metrics.overallThroughputMBps << ",\n";
+    out << "    \"estimatedMetadataBytes\": " << result.metrics.totalEstimatedMetadataBytes << "\n";
+    out << "  },\n";
+
+    out << "  \"files\": [\n";
+    for (size_t i = 0; i < result.files.size(); ++i) {
+        const auto& f = result.files[i];
+        out << "    {\n";
+        out << "      \"path\": \"" << jsonEscape(f.relativePath) << "\",\n";
+        out << "      \"size\": " << f.metrics.fileSize << ",\n";
+        out << "      \"strategy\": \"" << f.metrics.selectedStrategy << "\",\n";
+        out << "      \"reason\": \"" << jsonEscape(f.decision.reason) << "\",\n";
+        out << "      \"chunkCount\": " << f.chunks.size() << ",\n";
+        out << "      \"avgChunkSize\": " << std::fixed << std::setprecision(1) << f.metrics.avgChunkSize << ",\n";
+        out << "      \"minChunkSize\": " << f.metrics.minChunkSize << ",\n";
+        out << "      \"maxChunkSize\": " << f.metrics.maxChunkSize << ",\n";
+        out << "      \"totalTimeMs\": " << std::fixed << std::setprecision(3) << f.metrics.totalDurationMs << ",\n";
+        out << "      \"chunks\": [\n";
+        for (size_t c = 0; c < f.chunks.size(); ++c) {
+            const auto& chunk = f.chunks[c];
+            out << "        {\"seq\": " << chunk.sequenceNumber
+                << ", \"offset\": " << chunk.offset
+                << ", \"length\": " << chunk.length
+                << ", \"fingerprint\": \"" << chunk.fingerprint << "\""
+                << ", \"crc32\": " << chunk.crc32
+                << ", \"algorithm\": \"" << chunk.algorithm << "\"}";
+            if (c + 1 < f.chunks.size()) out << ",";
+            out << "\n";
+        }
+        out << "      ]\n";
+        out << "    }";
+        if (i + 1 < result.files.size()) out << ",";
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+static void printUsage(const char* progName) {
+    std::cout << "RetroTransfer - Project Scanner and Adaptive Chunking Engine\n";
+    std::cout << "Usage:\n";
+    std::cout << "  " << progName << " [directory] [output.json] [options]\n\n";
+    std::cout << "Arguments:\n";
+    std::cout << "  [directory]           Root directory to scan (default: \".\")\n";
+    std::cout << "  [output.json]         Filename for scan output inside collection/ (default: \"scan.json\")\n\n";
+    std::cout << "Options:\n";
+    std::cout << "  --strategy, -s <mode> Chunking strategy: \"adaptive\" (default), \"fixed\", or \"cdc\"\n";
+    std::cout << "  --chunk-size <bytes>  Fixed chunk size in bytes (default: 65536)\n";
+    std::cout << "  --min-chunk <bytes>   CDC minimum chunk size (default: 16384)\n";
+    std::cout << "  --target-chunk <bytes> CDC target chunk size (default: 65536)\n";
+    std::cout << "  --max-chunk <bytes>   CDC maximum chunk size (default: 262144)\n";
+    std::cout << "  --benchmark           Run repeatable benchmark comparing Fixed, CDC, and Adaptive\n";
+    std::cout << "  --no-chunk            Only perform project scan, skip chunking stage\n";
+    std::cout << "  --help, -h            Show this help message\n";
+}
+
+static void runBenchmark(const DirectoryNode& directoryTree,
+                         const std::string& path,
+                         const EngineConfig& baseConfig) {
+    std::cout << "\n============================================================\n";
+    std::cout << "        RETROTRANSFER CHUNKING STRATEGY BENCHMARK           \n";
+    std::cout << "============================================================\n";
+
+    std::vector<ChunkStrategy> strategies = {
+        ChunkStrategy::Fixed,
+        ChunkStrategy::CDC,
+        ChunkStrategy::Adaptive
+    };
+
+    struct BenchRow {
+        std::string name;
+        size_t chunks;
+        size_t uniqueFp;
+        uint64_t dedupBytes;
+        double dedupRatio;
+        double chunkTimeMs;
+        double fpTimeMs;
+        double totalTimeMs;
+        double throughputMBps;
+        uint64_t metadataBytes;
+    };
+
+    std::vector<BenchRow> rows;
+
+    for (auto strat : strategies) {
+        EngineConfig cfg = baseConfig;
+        cfg.strategy = strat;
+        ChunkEngine engine(cfg);
+
+        ProjectChunkResult res = engine.processScannedProject(directoryTree, path);
+        BenchRow row;
+        row.name = strategy_to_string(strat);
+        row.chunks = res.metrics.totalChunksGenerated;
+        row.uniqueFp = res.metrics.uniqueFingerprints;
+        row.dedupBytes = res.metrics.deduplicatedBytes;
+        row.dedupRatio = res.metrics.internalDedupRatio * 100.0;
+        row.chunkTimeMs = res.metrics.totalChunkingTimeMs;
+        row.fpTimeMs = res.metrics.totalFingerprintingTimeMs;
+        row.totalTimeMs = res.metrics.totalExecutionTimeMs;
+        row.throughputMBps = res.metrics.overallThroughputMBps;
+        row.metadataBytes = res.metrics.totalEstimatedMetadataBytes;
+        rows.push_back(row);
+    }
+
+    std::cout << std::left 
+              << std::setw(12) << "Strategy"
+              << std::setw(10) << "Chunks"
+              << std::setw(12) << "Unique FPs"
+              << std::setw(12) << "Dedup %"
+              << std::setw(14) << "Time (ms)"
+              << std::setw(18) << "Throughput(MB/s)"
+              << std::setw(16) << "Metadata (KB)"
+              << "\n";
+    std::cout << std::string(84, '-') << "\n";
+
+    for (const auto& r : rows) {
+        std::cout << std::left 
+                  << std::setw(12) << r.name
+                  << std::setw(10) << r.chunks
+                  << std::setw(12) << r.uniqueFp
+                  << std::setw(12) << (std::to_string(static_cast<int>(r.dedupRatio * 10) / 10.0) + "%")
+                  << std::setw(14) << std::fixed << std::setprecision(2) << r.totalTimeMs
+                  << std::setw(18) << std::fixed << std::setprecision(2) << r.throughputMBps
+                  << std::setw(16) << (r.metadataBytes / 1024)
+                  << "\n";
+    }
+    std::cout << "============================================================\n\n";
+}
+
 int main(int argc, char* argv[]) {
-    const string path = argc > 1 ? argv[1] : ".";
-    const filesystem::path collectionFolder = "collection";
-    const string outputName = argc > 2 ? argv[2] : "scan.json";
-    const filesystem::path outputPath = collectionFolder / filesystem::path(outputName).filename();
+    std::string path = ".";
+    std::string outputName = "scan.json";
+    bool enableChunking = true;
+    bool benchmarkMode = false;
+
+    EngineConfig config;
+
+    // Parse command-line arguments and fail clearly on malformed values.
+    int positionalIdx = 0;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            printUsage(argv[0]);
+            return 0;
+        } else if (arg == "--no-chunk") {
+            enableChunking = false;
+        } else if (arg == "--benchmark") {
+            benchmarkMode = true;
+        } else if (arg == "--strategy" || arg == "-s") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a strategy value.\n";
+                return 2;
+            }
+            const std::string strategyText = argv[++i];
+            if (!string_to_strategy(strategyText, config.strategy)) {
+                std::cerr << "Error: Unknown strategy '" << strategyText
+                          << "'. Choose adaptive, fixed, or cdc.\n";
+                return 2;
+            }
+        } else if (arg == "--chunk-size" || arg == "--min-chunk" ||
+                   arg == "--target-chunk" || arg == "--max-chunk") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a positive byte count (max 1 GiB).\n";
+                return 2;
+            }
+            size_t parsed = 0;
+            const std::string valueText = argv[++i];
+            if (!parseSizeArgument(valueText, parsed)) {
+                std::cerr << "Error: Invalid value '" << valueText << "' for " << arg
+                          << ". Use a positive integer up to 1073741824 bytes.\n";
+                return 2;
+            }
+            if (arg == "--chunk-size") {
+                config.fixedConfig.chunkSize = parsed;
+            } else if (arg == "--min-chunk") {
+                config.cdcConfig.minChunkSize = parsed;
+                config.cdcConfig.update_mask();
+            } else if (arg == "--target-chunk") {
+                config.cdcConfig.targetChunkSize = parsed;
+                config.cdcConfig.update_mask();
+            } else {
+                config.cdcConfig.maxChunkSize = parsed;
+            }
+        } else if (arg.rfind("--", 0) == 0) {
+            std::cerr << "Error: Unrecognized option: " << arg << "\n";
+            return 2;
+        } else {
+            if (positionalIdx == 0) {
+                path = arg;
+                ++positionalIdx;
+            } else if (positionalIdx == 1) {
+                outputName = arg;
+                ++positionalIdx;
+            } else {
+                std::cerr << "Error: Unexpected positional argument: " << arg << "\n";
+                return 2;
+            }
+        }
+    }
+
+    if (!config.fixedConfig.isValid() || !config.cdcConfig.isValid()) {
+        std::cerr << "Error: Invalid chunk configuration. Require 0 < min <= target <= max; "
+                     "all sizes must be at most 1 GiB.\n";
+        return 2;
+    }
+
+    std::error_code rootError;
+    if (!fs::exists(path, rootError) || rootError || !fs::is_directory(path, rootError) || rootError) {
+        std::cerr << "Error: Scan root is not an accessible directory: " << path << "\n";
+        return 1;
+    }
+
+    const fs::path collectionFolder = "collection";
+    const fs::path outputPath = collectionFolder / fs::path(outputName).filename();
+
+    // 1. Project Scanner Stage
+    std::cout << "[Stage 1/2] Scanning directory: " << path << " ...\n";
     ProjectScanner scanner(path);
     const DirectoryNode directoryTree = scanner.scan();
 
-    filesystem::create_directories(collectionFolder);
-    ofstream output(outputPath);
+    std::error_code outputDirError;
+    fs::create_directories(collectionFolder, outputDirError);
+    if (outputDirError) {
+        std::cerr << "Error: Could not create output directory " << collectionFolder
+                  << ": " << outputDirError.message() << "\n";
+        return 1;
+    }
+    std::ofstream output(outputPath);
     if (!output) {
-        cerr << "Error: Could not create output file.\n";
+        std::cerr << "Error: Could not create output file: " << outputPath << "\n";
         return 1;
     }
 
     writeDirectory(output, directoryTree, 0);
     output << "\n";
+    output.close();
+    if (!output) {
+        std::cerr << "Error: Failed while writing scan output: " << outputPath << "\n";
+        return 1;
+    }
+    std::cout << "Saved scan data to " << outputPath << "\n";
 
-    cout << "Saved scan data to " << outputPath << "\n";
+    // 2. Chunking Engine Stage
+    if (enableChunking) {
+        std::cout << "[Stage 2/2] Running Chunking Engine (Mode: " 
+                  << strategy_to_string(config.strategy) << ") ...\n";
+
+        ChunkEngine engine(config);
+        ProjectChunkResult chunkResult = engine.processScannedProject(directoryTree, path);
+
+        // Save chunk manifest
+        fs::path chunkOutFilename = outputPath.stem().string() + "_chunks.json";
+        fs::path chunkOutputPath = collectionFolder / chunkOutFilename;
+        std::ofstream chunkOut(chunkOutputPath);
+        if (!chunkOut) {
+            std::cerr << "Error: Could not create chunk manifest: " << chunkOutputPath << "\n";
+            return 1;
+        }
+        writeChunkManifestJson(chunkOut, chunkResult, config, path);
+        chunkOut.close();
+        if (!chunkOut) {
+            std::cerr << "Error: Failed while writing chunk manifest: " << chunkOutputPath << "\n";
+            return 1;
+        }
+        std::cout << "Saved chunk manifest to " << chunkOutputPath << "\n";
+
+        std::cout << "\n--- Chunking Engine Summary ---\n";
+        std::cout << "Files processed    : " << chunkResult.metrics.totalFilesProcessed << "\n";
+        std::cout << "Total bytes        : " << chunkResult.metrics.totalBytesProcessed << " bytes ("
+                  << std::fixed << std::setprecision(2)
+                  << (static_cast<double>(chunkResult.metrics.totalBytesProcessed) / (1024.0 * 1024.0)) << " MB)\n";
+        std::cout << "Chunks generated   : " << chunkResult.metrics.totalChunksGenerated << "\n";
+        std::cout << "Unique fingerprints: " << chunkResult.metrics.uniqueFingerprints << "\n";
+        std::cout << "Internal dedup bytes: " << chunkResult.metrics.deduplicatedBytes << " bytes ("
+                  << std::fixed << std::setprecision(2)
+                  << (chunkResult.metrics.internalDedupRatio * 100.0) << "%)\n";
+        std::cout << "Chunking time      : " << std::fixed << std::setprecision(2)
+                  << chunkResult.metrics.totalChunkingTimeMs << " ms\n";
+        std::cout << "Fingerprinting time: " << std::fixed << std::setprecision(2)
+                  << chunkResult.metrics.totalFingerprintingTimeMs << " ms\n";
+        std::cout << "Total engine time  : " << std::fixed << std::setprecision(2)
+                  << chunkResult.metrics.totalExecutionTimeMs << " ms\n";
+        std::cout << "Overall throughput : " << std::fixed << std::setprecision(2)
+                  << chunkResult.metrics.overallThroughputMBps << " MB/s\n";
+        std::cout << "--------------------------------\n";
+
+        if (benchmarkMode) {
+            runBenchmark(directoryTree, path, config);
+        }
+    }
 
     return 0;
 }
