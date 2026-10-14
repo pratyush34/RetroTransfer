@@ -25,6 +25,10 @@ add_executable(RetroTransfer
     ${RETRO_CORE_SOURCES}
 )
 
+add_executable(RetroTransferSetupCLI
+    examples/transfer_setup_cli.cpp
+)
+
 enable_testing()
 
 add_executable(test_chunking
