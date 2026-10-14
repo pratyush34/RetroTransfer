@@ -398,8 +398,10 @@ static void test_cdc_content_boundaries_trigger() {
 static void test_scanner_skips_generated_dirs_and_symlinks() {
     setupTestDir();
     fs::create_directories(TEST_DIR / "collection");
+    fs::create_directories(TEST_DIR / "build-scratch");
     createTestFileText("visible.txt", "scan me");
     createTestFileText("collection/generated.json", "generated output");
+    createTestFileText("build-scratch/generated.cpp", "generated build output");
 
     std::error_code linkError;
     const fs::path absoluteRoot = fs::absolute(TEST_DIR);

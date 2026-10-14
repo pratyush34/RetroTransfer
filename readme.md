@@ -1,40 +1,48 @@
 # RetroTransfer
 
-Pratyush & Mahesh
+Pratyush
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ### Quick Build & Run (MinGW / UCRT64 + CMake)
 
 ```powershell
-# Set compiler environment if not already in system PATH:
-$env:Path = "D:\mingw64\bin;C:\msys64\ucrt64\bin;C:\Program Files\CMake\bin;$env:Path"
+# Use the MSYS2 UCRT64 compiler and MinGW Make if they are installed:
+$env:Path = "C:\msys64\ucrt64\bin;C:\MinGW\bin;C:\Program Files\CMake\bin;$env:Path"
 
-# Configure and build
-cmake -B build -G "Ninja"
-cmake --build build
+# Configure a fresh build directory and build
+cmake -S . -B build-ucrt64 -G "MinGW Makefiles" `
+  -DCMAKE_C_COMPILER="C:\msys64\ucrt64\bin\gcc.exe" `
+  -DCMAKE_CXX_COMPILER="C:\msys64\ucrt64\bin\g++.exe" `
+  -DCMAKE_MAKE_PROGRAM="C:\MinGW\bin\mingw32-make.exe"
+cmake --build build-ucrt64 --parallel
 
 # Run project scan and adaptive chunking on current directory
-.\build\RetroTransfer.exe .
+.\build-ucrt64\RetroTransfer.exe .
 
 # Run automated test suite
-ctest --test-dir build --output-on-failure
+ctest --test-dir build-ucrt64 --output-on-failure
 ```
 
 The scan is saved as JSON in the `collection` folder by default:
 ```powershell
-.\build\RetroTransfer.exe "any directory"
+.\build-ucrt64\RetroTransfer.exe "any directory"
 ```
 
-To choose a different JSON filename inside `collection`, provide it as the second argument:
+To choose the scan and chunk manifest filenames independently, use:
 ```powershell
-.\build\RetroTransfer.exe "any directory" "project-name.json"
+.\build-ucrt64\RetroTransfer.exe "any directory" `
+  --scan-output "project-scan.json" `
+  --chunks-output "project-chunks.json"
 ```
+
+Both files are saved in `collection`. The `.json` extension is added if omitted.
+The legacy second positional argument still names the scan file. If an identical
+scan already exists under another JSON filename, the app reuses that existing
+file and avoids creating a duplicate. Existing files are never automatically deleted.
 
 Each saved JSON file contains a directory tree. Every directory has `name`, `path`,
 `directories`, and `files` fields. Every file records its `name`, `path`, `size`,
 `type`, and `modificationTime`.
-
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ## 1. Project Overview
 
@@ -161,26 +169,35 @@ Every file decision records its rationale string in the JSON manifest for audita
 
 ## 7. CLI Usage & Options
 
-The command syntax supports the established positional arguments and strategy options:
+The command syntax supports legacy positional arguments and named output options:
 
 ```bash
 # Basic scan + default adaptive chunking
 ./RetroTransfer [directory] [output.json]
 
+# Give the scan and chunk manifest independent names (inside collection/)
+./RetroTransfer . --scan-output project-scan --chunks-output project-chunks.json
+
 # Select chunking strategy explicitly
-./RetroTransfer . scan.json --strategy fixed --chunk-size 32768
-./RetroTransfer . scan.json --strategy cdc --min-chunk 4096 --target-chunk 16384 --max-chunk 65536
-./RetroTransfer . scan.json --strategy adaptive
+./RetroTransfer . --scan-output scan.json --strategy fixed --chunk-size 32768
+./RetroTransfer . --scan-output scan.json --strategy cdc --min-chunk 4096 --target-chunk 16384 --max-chunk 65536
+./RetroTransfer . --strategy adaptive
 
 # Run comparative benchmark across Fixed, CDC, and Adaptive
-./RetroTransfer . scan.json --benchmark
+./RetroTransfer . --benchmark
 
 # Scan-only mode (skip chunking)
-./RetroTransfer . scan.json --no-chunk
+./RetroTransfer . --scan-output scan-only.json --no-chunk
 
 # Help
 ./RetroTransfer --help
 ```
+
+`--scan-output` defaults to `scan.json`; `--chunks-output` defaults to the scan
+name with `_chunks.json` appended. Either option accepts a filename with or
+without the `.json` extension; output names cannot include a directory. Exact
+duplicate scan contents are not written under a second filename. Existing JSON
+files are kept, and explicitly selected output files may be overwritten.
 
 Chunk-size arguments must be positive integers no larger than 1 GiB. Invalid or inconsistent sizes are rejected before scanning.
 

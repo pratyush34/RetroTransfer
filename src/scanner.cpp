@@ -9,8 +9,7 @@
 namespace fs = std::filesystem;
 
 ProjectScanner::ProjectScanner(const std::string& path) : root_path(path) {
-    ignored_folders = {".git", "build", "build-mingw", "build-ucrt64", "collection",
-                       "node_modules", ".vscode", "bin", "obj"};
+    ignored_folders = {".git", "collection", "node_modules", ".vscode", "bin", "obj"};
     ignored_extensions = {".o", ".exe", ".dll", ".class"};
 }
 
@@ -25,11 +24,16 @@ static std::string lowerAscii(std::string value) {
 }
 
 static bool containsName(const std::vector<std::string>& names, const fs::path& path) {
-    const std::string name = path.filename().string();
+    const std::string name = lowerAscii(path.filename().string());
     for (const auto& candidate : names) {
-        if (name == candidate) return true;
+        if (name == lowerAscii(candidate)) return true;
     }
     return false;
+}
+
+static bool isBuildOutputDirectory(const fs::path& path) {
+    const std::string name = lowerAscii(path.filename().string());
+    return name == "build" || name.rfind("build-", 0) == 0;
 }
 
 static bool containsExtension(const std::vector<std::string>& extensions, const fs::path& path) {
@@ -84,7 +88,8 @@ static DirectoryNode scanDirectory(const fs::path& directory,
         }
 
         if (isDirectory) {
-            if (!containsName(ignoredFolders, entryPath)) {
+            if (!containsName(ignoredFolders, entryPath) &&
+                !isBuildOutputDirectory(entryPath)) {
                 node.directories.push_back(
                     scanDirectory(entryPath, ignoredFolders, ignoredExtensions));
             }

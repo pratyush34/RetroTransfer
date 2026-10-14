@@ -2,6 +2,7 @@
 #include "chunk_engine.h"
 #include "chunk_config.h"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <filesystem>
@@ -66,11 +67,89 @@ static bool parseSizeArgument(const std::string& text, size_t& value) {
     }
 }
 
-static void writeIndent(std::ofstream& output, int depth) {
+static bool normalizeJsonFilename(std::string& filename) {
+    if (filename.empty()) return false;
+
+    const fs::path path(filename);
+    if (path.is_absolute() || path.has_parent_path() ||
+        path.filename() == "." || path.filename() == "..") {
+        return false;
+    }
+
+    if (path.extension().empty()) {
+        filename += ".json";
+        return true;
+    }
+
+    std::string extension = path.extension().string();
+    for (char& character : extension) {
+        character = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character)));
+    }
+    return extension == ".json";
+}
+
+static bool sameOutputPath(const fs::path& first, const fs::path& second) {
+    std::string firstName = first.lexically_normal().generic_string();
+    std::string secondName = second.lexically_normal().generic_string();
+    if (firstName.size() != secondName.size()) return false;
+    return std::equal(firstName.begin(), firstName.end(), secondName.begin(),
+                      [](unsigned char left, unsigned char right) {
+                          return std::tolower(left) == std::tolower(right);
+                      });
+}
+
+static bool filesHaveSameContents(const fs::path& first, const fs::path& second) {
+    std::error_code firstError;
+    std::error_code secondError;
+    const uintmax_t firstSize = fs::file_size(first, firstError);
+    const uintmax_t secondSize = fs::file_size(second, secondError);
+    if (firstError || secondError || firstSize != secondSize) return false;
+
+    std::ifstream firstFile(first, std::ios::binary);
+    std::ifstream secondFile(second, std::ios::binary);
+    if (!firstFile || !secondFile) return false;
+    return std::equal(std::istreambuf_iterator<char>(firstFile),
+                      std::istreambuf_iterator<char>(),
+                      std::istreambuf_iterator<char>(secondFile),
+                      std::istreambuf_iterator<char>());
+}
+
+static fs::path findIdenticalJsonFile(const fs::path& directory,
+                                      const fs::path& candidate,
+                                      const fs::path& excludedPath,
+                                      std::error_code& error) {
+    fs::directory_iterator iterator(directory, error);
+    const fs::directory_iterator end;
+    if (error) return {};
+
+    while (iterator != end) {
+        const fs::directory_entry entry = *iterator;
+        if (!entry.is_regular_file(error)) {
+            if (error) return {};
+        } else {
+            std::string extension = entry.path().extension().string();
+            for (char& character : extension) {
+                character = static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(character)));
+            }
+            if (entry.path() != candidate && entry.path() != excludedPath &&
+                extension == ".json" &&
+                filesHaveSameContents(entry.path(), candidate)) {
+                return entry.path();
+            }
+        }
+        iterator.increment(error);
+        if (error) return {};
+    }
+    return {};
+}
+
+static void writeIndent(std::ostream& output, int depth) {
     output << std::string(static_cast<size_t>(depth * 2), ' ');
 }
 
-static void writeDirectory(std::ofstream& output, const DirectoryNode& directory, int depth) {
+static void writeDirectory(std::ostream& output, const DirectoryNode& directory, int depth) {
     writeIndent(output, depth);
     output << "{\n";
     writeIndent(output, depth + 1);
@@ -172,11 +251,13 @@ static void writeChunkManifestJson(std::ofstream& out,
 static void printUsage(const char* progName) {
     std::cout << "RetroTransfer - Project Scanner and Adaptive Chunking Engine\n";
     std::cout << "Usage:\n";
-    std::cout << "  " << progName << " [directory] [output.json] [options]\n\n";
+    std::cout << "  " << progName << " [directory] [scan.json] [options]\n\n";
     std::cout << "Arguments:\n";
     std::cout << "  [directory]           Root directory to scan (default: \".\")\n";
-    std::cout << "  [output.json]         Filename for scan output inside collection/ (default: \"scan.json\")\n\n";
+    std::cout << "  [scan.json]           Legacy positional scan filename inside collection/\n\n";
     std::cout << "Options:\n";
+    std::cout << "  --scan-output <name>  Scan JSON filename (default: \"scan.json\")\n";
+    std::cout << "  --chunks-output <name> Chunk manifest filename (default: <scan>_chunks.json)\n";
     std::cout << "  --strategy, -s <mode> Chunking strategy: \"adaptive\" (default), \"fixed\", or \"cdc\"\n";
     std::cout << "  --chunk-size <bytes>  Fixed chunk size in bytes (default: 65536)\n";
     std::cout << "  --min-chunk <bytes>   CDC minimum chunk size (default: 16384)\n";
@@ -204,10 +285,7 @@ static void runBenchmark(const DirectoryNode& directoryTree,
         std::string name;
         size_t chunks;
         size_t uniqueFp;
-        uint64_t dedupBytes;
         double dedupRatio;
-        double chunkTimeMs;
-        double fpTimeMs;
         double totalTimeMs;
         double throughputMBps;
         uint64_t metadataBytes;
@@ -225,10 +303,7 @@ static void runBenchmark(const DirectoryNode& directoryTree,
         row.name = strategy_to_string(strat);
         row.chunks = res.metrics.totalChunksGenerated;
         row.uniqueFp = res.metrics.uniqueFingerprints;
-        row.dedupBytes = res.metrics.deduplicatedBytes;
         row.dedupRatio = res.metrics.internalDedupRatio * 100.0;
-        row.chunkTimeMs = res.metrics.totalChunkingTimeMs;
-        row.fpTimeMs = res.metrics.totalFingerprintingTimeMs;
         row.totalTimeMs = res.metrics.totalExecutionTimeMs;
         row.throughputMBps = res.metrics.overallThroughputMBps;
         row.metadataBytes = res.metrics.totalEstimatedMetadataBytes;
@@ -262,7 +337,10 @@ static void runBenchmark(const DirectoryNode& directoryTree,
 
 int main(int argc, char* argv[]) {
     std::string path = ".";
-    std::string outputName = "scan.json";
+    std::string scanOutputName = "scan.json";
+    std::string chunksOutputName;
+    bool scanOutputSpecified = false;
+    bool chunksOutputSpecified = false;
     bool enableChunking = true;
     bool benchmarkMode = false;
 
@@ -279,6 +357,25 @@ int main(int argc, char* argv[]) {
             enableChunking = false;
         } else if (arg == "--benchmark") {
             benchmarkMode = true;
+        } else if (arg == "--scan-output" || arg == "--chunks-output") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a JSON filename.\n";
+                return 2;
+            }
+            std::string& outputName = arg == "--scan-output"
+                ? scanOutputName
+                : chunksOutputName;
+            outputName = argv[++i];
+            if (!normalizeJsonFilename(outputName)) {
+                std::cerr << "Error: " << arg
+                          << " requires a filename ending in .json (directories are not allowed).\n";
+                return 2;
+            }
+            if (arg == "--scan-output") {
+                scanOutputSpecified = true;
+            } else {
+                chunksOutputSpecified = true;
+            }
         } else if (arg == "--strategy" || arg == "-s") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: " << arg << " requires a strategy value.\n";
@@ -322,7 +419,16 @@ int main(int argc, char* argv[]) {
                 path = arg;
                 ++positionalIdx;
             } else if (positionalIdx == 1) {
-                outputName = arg;
+                if (scanOutputSpecified) {
+                    std::cerr << "Error: Specify the scan output either positionally or with --scan-output, not both.\n";
+                    return 2;
+                }
+                scanOutputName = arg;
+                if (!normalizeJsonFilename(scanOutputName)) {
+                    std::cerr << "Error: Scan output must be a JSON filename without a directory.\n";
+                    return 2;
+                }
+                scanOutputSpecified = true;
                 ++positionalIdx;
             } else {
                 std::cerr << "Error: Unexpected positional argument: " << arg << "\n";
@@ -344,7 +450,15 @@ int main(int argc, char* argv[]) {
     }
 
     const fs::path collectionFolder = "collection";
-    const fs::path outputPath = collectionFolder / fs::path(outputName).filename();
+    const fs::path outputPath = collectionFolder / scanOutputName;
+    if (!chunksOutputSpecified) {
+        chunksOutputName = outputPath.stem().string() + "_chunks.json";
+    }
+    const fs::path chunkOutputPath = collectionFolder / chunksOutputName;
+    if (enableChunking && sameOutputPath(outputPath, chunkOutputPath)) {
+        std::cerr << "Error: Scan and chunk manifest filenames must be different.\n";
+        return 2;
+    }
 
     // 1. Project Scanner Stage
     std::cout << "[Stage 1/2] Scanning directory: " << path << " ...\n";
@@ -358,12 +472,12 @@ int main(int argc, char* argv[]) {
                   << ": " << outputDirError.message() << "\n";
         return 1;
     }
+    const bool outputPreviouslyExisted = fs::exists(outputPath);
     std::ofstream output(outputPath);
     if (!output) {
         std::cerr << "Error: Could not create output file: " << outputPath << "\n";
         return 1;
     }
-
     writeDirectory(output, directoryTree, 0);
     output << "\n";
     output.close();
@@ -371,7 +485,29 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: Failed while writing scan output: " << outputPath << "\n";
         return 1;
     }
-    std::cout << "Saved scan data to " << outputPath << "\n";
+
+    std::error_code duplicateCheckError;
+    const fs::path duplicateScan = outputPreviouslyExisted
+        ? fs::path{}
+        : findIdenticalJsonFile(collectionFolder, outputPath, chunkOutputPath,
+                                duplicateCheckError);
+    if (duplicateCheckError) {
+        std::cerr << "Error: Could not check for duplicate scan files in "
+                  << collectionFolder << ": " << duplicateCheckError.message() << "\n";
+        return 1;
+    }
+    if (!duplicateScan.empty()) {
+        std::error_code removeError;
+        if (!fs::remove(outputPath, removeError) || removeError) {
+            std::cerr << "Error: Could not remove newly created duplicate scan "
+                      << outputPath << ": " << removeError.message() << "\n";
+            return 1;
+        }
+        std::cout << "Scan is identical to existing file " << duplicateScan
+                  << "; skipped creating duplicate " << outputPath << "\n";
+    } else {
+        std::cout << "Saved scan data to " << outputPath << "\n";
+    }
 
     // 2. Chunking Engine Stage
     if (enableChunking) {
@@ -382,8 +518,6 @@ int main(int argc, char* argv[]) {
         ProjectChunkResult chunkResult = engine.processScannedProject(directoryTree, path);
 
         // Save chunk manifest
-        fs::path chunkOutFilename = outputPath.stem().string() + "_chunks.json";
-        fs::path chunkOutputPath = collectionFolder / chunkOutFilename;
         std::ofstream chunkOut(chunkOutputPath);
         if (!chunkOut) {
             std::cerr << "Error: Could not create chunk manifest: " << chunkOutputPath << "\n";

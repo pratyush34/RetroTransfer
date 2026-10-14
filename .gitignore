@@ -1,6 +1,5 @@
 build/
-build-mingw/
-build-ucrt64/
+build-*/
 *.exe
 *.json
 collection/
