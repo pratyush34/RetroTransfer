@@ -30,6 +30,18 @@ To choose a different JSON filename inside `collection`, provide it as the secon
 .\build\RetroTransfer.exe "any directory" "project-name.json"
 ```
 
+### Optional transfer setup CLI prototype
+
+Build and run the standalone setup-menu prototype with:
+```powershell
+cmake --build build --target RetroTransferSetupCLI
+.\build\RetroTransferSetupCLI.exe
+```
+
+This is a separate prototype and does not replace the existing `RetroTransfer`
+application. It collects a folder path and receiver IP; network file transfer is
+not implemented yet.
+
 Each saved JSON file contains a directory tree. Every directory has `name`, `path`,
 `directories`, and `files` fields. Every file records its `name`, `path`, `size`,
 `type`, and `modificationTime`.
