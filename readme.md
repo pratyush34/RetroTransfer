@@ -2,6 +2,9 @@
 
 Pratyush
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+###cli launch 
+Set-Location "C:\Users\Pratyush\Downloads\coding\RetroTransfer"
+.\build-ucrt64\RetroTransferSetupCLI.exe
 
 ### Quick Build & Run (MinGW / UCRT64 + CMake)
 
@@ -21,12 +24,38 @@ $env:PATH = 'C:\msys64\ucrt64\bin;C:\msys64\usr\bin;' + $env:PATH
 cmake --build build-ucrt64 --parallel
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Set-Location "C:\Users\Pratyush\Downloads\coding\RetroTransfer"
+
+# Create a new, empty baseline folder
+$baseline = Join-Path $env:TEMP ("RetroTransfer-empty-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $baseline | Out-Null
+
+# Package the tennis game project
+.\build-ucrt64\RetroTransfer.exe "C:\Users\Pratyush\Downloads\coding\2d tennis game" `
+  --baseline $baseline `
+  --scan-output tennisGame-package-scan.json `
+  --chunks-output tennisGame-package-chunks.json `
+  --payload-output tennisGame-first.rtpack
+
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 # Run project scan and adaptive chunking on current directory
 .\build-ucrt64\RetroTransfer.exe .
+
+# Launch the interactive console UI (enter 1 for scan/chunk or 2 for compression)
+.\build-ucrt64\RetroTransferSetupCLI.exe
 
 # Run automated test suite
 ctest --test-dir build-ucrt64 --output-on-failure
 ```
+
+The interactive UI asks for the project folder and output filenames. For option
+2, choose whether to compare with an older project. Choose `y` and enter that
+folder to package only chunks it does not already contain; choose `n` (or leave
+the answer blank) to compress all unique chunks for a first package. Enter folder
+paths with or without surrounding double quotes. Outputs are created in the
+`collection` folder under the directory from which the UI is launched. The UI
+does not perform network transfer or reconstruction.
 
 #Scan , chunk and compare
 
@@ -193,6 +222,8 @@ Pass `--baseline <folder>` to simulate the receiver having an earlier project co
 5. Huffman-encodes unique missing chunks; if the encoded form is not smaller, stores that chunk raw instead.
 6. Writes a local `.rtpack` file and adds each payload offset, codec, fingerprint, source offset, and size to the chunk JSON manifest.
 
+For a first package with no older copy, use `--compress-all` instead of `--baseline`. This treats every current chunk as missing and packages each unique chunk once. The interactive UI offers this choice when you select compression.
+
 This is **local selective packaging**, not network transfer. The baseline is rescanned on every run; no persistent receiver index is written. The current file/chunk manifest still describes all current chunks, while `selectiveCompression.payloadChunks` lists only unique missing payload entries. Metrics distinguish chunks missing from the baseline (`missingChunks`) from repeated current-project chunks omitted from storage (`duplicateChunks`). `compressionBytesSaved` measures savings from encoding unique missing input; `totalBytesAvoided` compares all current source bytes with the actual payload plus its header. The RTPK file is a temporary hand-off artifact for the future transfer stage; there is not yet a receiver-side decoder or reconstruction command.
 
 The Huffman codec stores a canonical code-length table for each encoded chunk. Chunk payloads that cannot be reduced are stored raw. Huffman is lossless; tests exercise the codec decoder to verify round-trips, but a project-level restore feature is not yet provided.
@@ -212,6 +243,9 @@ The command syntax supports legacy positional arguments and named output options
 
 # Compare a new project against an earlier local copy and package only missing chunks
 ./RetroTransfer "C:\projects\MyProject-v2" --baseline "C:\projects\MyProject-v1" --payload-output v2-missing.rtpack
+
+# Make a first package without an older baseline
+./RetroTransfer "C:\projects\MyProject" --compress-all --payload-output first-package.rtpack
 
 # Select chunking strategy explicitly
 ./RetroTransfer . --scan-output scan.json --strategy fixed --chunk-size 32768
