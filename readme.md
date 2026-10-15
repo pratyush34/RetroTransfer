@@ -1,29 +1,31 @@
 # RetroTransfer
 
-Pratyush
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ### Quick Build & Run (MinGW / UCRT64 + CMake)
 
 ```powershell
 # Use the MSYS2 UCRT64 compiler and MinGW Make if they are installed:
 $env:Path = "C:\msys64\ucrt64\bin;C:\MinGW\bin;C:\Program Files\CMake\bin;$env:Path"
+```
 
 # Configure a fresh build directory and build
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+```powershell
 cmake -S . -B build-ucrt64 -G "MinGW Makefiles" `
   -DCMAKE_C_COMPILER="C:\msys64\ucrt64\bin\gcc.exe" `
   -DCMAKE_CXX_COMPILER="C:\msys64\ucrt64\bin\g++.exe" `
   -DCMAKE_MAKE_PROGRAM="C:\MinGW\bin\mingw32-make.exe"
 cmake --build build-ucrt64 --parallel
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+```powershell
 $env:PATH = 'C:\msys64\ucrt64\bin;C:\msys64\usr\bin;' + $env:PATH
 cmake --build build-ucrt64 --parallel
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
+```
+```powershell
 # Run project scan and adaptive chunking on current directory
 .\build-ucrt64\RetroTransfer.exe .
-
+```
+```powershell
 # Run automated test suite
 ctest --test-dir build-ucrt64 --output-on-failure
 ```
