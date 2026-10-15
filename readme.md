@@ -1,29 +1,41 @@
 # RetroTransfer
 
-Pratyush
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-###cli launch 
+### CLI launch 
+```powershell
 Set-Location "C:\Users\Pratyush\Downloads\coding\RetroTransfer"
 .\build-ucrt64\RetroTransferSetupCLI.exe
+```
 
 ### Quick Build & Run (MinGW / UCRT64 + CMake)
 
 ```powershell
 # Use the MSYS2 UCRT64 compiler and MinGW Make if they are installed:
 $env:Path = "C:\msys64\ucrt64\bin;C:\MinGW\bin;C:\Program Files\CMake\bin;$env:Path"
+```
 
 # Configure a fresh build directory and build
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+```powershell
 cmake -S . -B build-ucrt64 -G "MinGW Makefiles" `
   -DCMAKE_C_COMPILER="C:\msys64\ucrt64\bin\gcc.exe" `
   -DCMAKE_CXX_COMPILER="C:\msys64\ucrt64\bin\g++.exe" `
   -DCMAKE_MAKE_PROGRAM="C:\MinGW\bin\mingw32-make.exe"
 cmake --build build-ucrt64 --parallel
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+```powershell
 $env:PATH = 'C:\msys64\ucrt64\bin;C:\msys64\usr\bin;' + $env:PATH
 cmake --build build-ucrt64 --parallel
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+```powershell
+# Run project scan and adaptive chunking on current directory
+.\build-ucrt64\RetroTransfer.exe .
+```
+```powershell
+# Run automated test suite
+ctest --test-dir build-ucrt64 --output-on-failure
+```
 
+```powershell
 Set-Location "C:\Users\Pratyush\Downloads\coding\RetroTransfer"
 
 # Create a new, empty baseline folder
@@ -36,27 +48,7 @@ New-Item -ItemType Directory -Path $baseline | Out-Null
   --scan-output tennisGame-package-scan.json `
   --chunks-output tennisGame-package-chunks.json `
   --payload-output tennisGame-first.rtpack
-
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-# Run project scan and adaptive chunking on current directory
-.\build-ucrt64\RetroTransfer.exe .
-
-# Launch the interactive console UI (enter 1 for scan/chunk or 2 for compression)
-.\build-ucrt64\RetroTransferSetupCLI.exe
-
-# Run automated test suite
-ctest --test-dir build-ucrt64 --output-on-failure
 ```
-
-The interactive UI asks for the project folder and output filenames. For option
-2, choose whether to compare with an older project. Choose `y` and enter that
-folder to package only chunks it does not already contain; choose `n` (or leave
-the answer blank) to compress all unique chunks for a first package. Enter folder
-paths with or without surrounding double quotes. Outputs are created in the
-`collection` folder under the directory from which the UI is launched. The UI
-does not perform network transfer or reconstruction.
-
 #Scan , chunk and compare
 
 ```powershell
