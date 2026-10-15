@@ -243,7 +243,11 @@ static void writeChunkManifestJson(std::ofstream& out,
     if (compression != nullptr) {
         const CompressionMetrics& metrics = compression->metrics;
         out << "  \"selectiveCompression\": {\n";
-        out << "    \"baselineRoot\": \"" << jsonEscape(baselinePath) << "\",\n";
+        out << "    \"baselineRoot\": \""
+            << jsonEscape(baselinePath.empty()
+                              ? "(none; all current chunks are packaged)"
+                              : baselinePath)
+            << "\",\n";
         out << "    \"payloadFile\": \"" << jsonEscape(payloadName) << "\",\n";
         out << "    \"payloadFormat\": \"RTPK-v1\",\n";
         out << "    \"codec\": \"canonical-huffman-per-chunk-with-raw-fallback\",\n";
@@ -328,7 +332,8 @@ static void printUsage(const char* progName) {
     std::cout << "  --scan-output <name>  Scan JSON filename (default: \"scan.json\")\n";
     std::cout << "  --chunks-output <name> Chunk manifest filename (default: <scan>_chunks.json)\n";
     std::cout << "  --baseline <directory> Compare against a local receiver/project copy\n";
-    std::cout << "  --payload-output <name> Compressed missing-chunk bundle (requires --baseline)\n";
+    std::cout << "  --compress-all        Package all unique chunks without a baseline\n";
+    std::cout << "  --payload-output <name> Compressed bundle (requires --baseline or --compress-all)\n";
     std::cout << "  --strategy, -s <mode> Chunking strategy: \"adaptive\" (default), \"fixed\", or \"cdc\"\n";
     std::cout << "  --chunk-size <bytes>  Fixed chunk size in bytes (default: 65536)\n";
     std::cout << "  --min-chunk <bytes>   CDC minimum chunk size (default: 16384)\n";
@@ -412,6 +417,7 @@ int main(int argc, char* argv[]) {
     std::string chunksOutputName;
     std::string baselinePath;
     std::string payloadOutputName;
+    bool compressAllChunks = false;
     bool scanOutputSpecified = false;
     bool chunksOutputSpecified = false;
     bool payloadOutputSpecified = false;
@@ -437,6 +443,8 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             baselinePath = argv[++i];
+        } else if (arg == "--compress-all") {
+            compressAllChunks = true;
         } else if (arg == "--payload-output") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --payload-output requires a .rtpack filename.\n";
@@ -538,8 +546,18 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: --baseline requires chunking; remove --no-chunk.\n";
         return 2;
     }
-    if (payloadOutputSpecified && baselinePath.empty()) {
-        std::cerr << "Error: --payload-output requires --baseline.\n";
+    if (compressAllChunks && !baselinePath.empty()) {
+        std::cerr << "Error: --compress-all cannot be combined with --baseline.\n";
+        return 2;
+    }
+    const bool selectiveCompressionEnabled =
+        compressAllChunks || !baselinePath.empty();
+    if (compressAllChunks && !enableChunking) {
+        std::cerr << "Error: --compress-all requires chunking; remove --no-chunk.\n";
+        return 2;
+    }
+    if (payloadOutputSpecified && !selectiveCompressionEnabled) {
+        std::cerr << "Error: --payload-output requires --baseline or --compress-all.\n";
         return 2;
     }
 
@@ -564,7 +582,7 @@ int main(int argc, char* argv[]) {
         chunksOutputName = outputPath.stem().string() + "_chunks.json";
     }
     const fs::path chunkOutputPath = collectionFolder / chunksOutputName;
-    if (!baselinePath.empty() && !payloadOutputSpecified) {
+    if (selectiveCompressionEnabled && !payloadOutputSpecified) {
         payloadOutputName = outputPath.stem().string() + "_payload.rtpack";
     }
     const fs::path payloadOutputPath = collectionFolder / payloadOutputName;
@@ -572,7 +590,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: Scan and chunk manifest filenames must be different.\n";
         return 2;
     }
-    if (enableChunking && !baselinePath.empty() &&
+    if (enableChunking && selectiveCompressionEnabled &&
         (sameOutputPath(outputPath, payloadOutputPath) ||
          sameOutputPath(chunkOutputPath, payloadOutputPath))) {
         std::cerr << "Error: Payload filename must differ from scan and chunk manifest filenames.\n";
@@ -638,12 +656,17 @@ int main(int argc, char* argv[]) {
 
         CompressionResult compressionResult;
         const CompressionResult* compression = nullptr;
-        if (!baselinePath.empty()) {
-            std::cout << "[Stage 3/3] Comparing baseline chunks and compressing missing chunks...\n";
-            ProjectScanner baselineScanner(baselinePath);
-            const DirectoryNode baselineTree = baselineScanner.scan();
-            const ProjectChunkResult baselineResult =
-                engine.processScannedProject(baselineTree, baselinePath);
+        if (selectiveCompressionEnabled) {
+            std::cout << (compressAllChunks
+                ? "[Stage 3/3] Compressing all unique project chunks...\n"
+                : "[Stage 3/3] Comparing baseline chunks and compressing missing chunks...\n");
+            ProjectChunkResult baselineResult;
+            if (!baselinePath.empty()) {
+                ProjectScanner baselineScanner(baselinePath);
+                const DirectoryNode baselineTree = baselineScanner.scan();
+                baselineResult =
+                    engine.processScannedProject(baselineTree, baselinePath);
+            }
 
             CompressionEngine compressor;
             std::string compressionError;

@@ -30,6 +30,7 @@ add_executable(RetroTransfer
 add_executable(RetroTransferSetupCLI
     examples/transfer_setup_cli.cpp
 )
+add_dependencies(RetroTransferSetupCLI RetroTransfer)
 
 enable_testing()
 
