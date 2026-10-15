@@ -30,6 +30,20 @@ cmake --build build-ucrt64 --parallel
 ctest --test-dir build-ucrt64 --output-on-failure
 ```
 
+```powershell
+Set-Location "C:\Users\Pratyush\Downloads\coding\RetroTransfer"
+
+# Create a new, empty baseline folder
+$baseline = Join-Path $env:TEMP ("RetroTransfer-empty-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $baseline | Out-Null
+
+# Package the tennis game project
+.\build-ucrt64\RetroTransfer.exe "C:\Users\Pratyush\Downloads\coding\2d tennis game" `
+  --baseline $baseline `
+  --scan-output tennisGame-package-scan.json `
+  --chunks-output tennisGame-package-chunks.json `
+  --payload-output tennisGame-first.rtpack
+```
 #Scan , chunk and compare
 
 ```powershell
