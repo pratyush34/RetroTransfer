@@ -1,5 +1,10 @@
 # RetroTransfer
 
+### CLI launch 
+```powershell
+Set-Location "C:\Users\Pratyush\Downloads\coding\RetroTransfer"
+.\build-ucrt64\RetroTransferSetupCLI.exe
+```
 
 ### Quick Build & Run (MinGW / UCRT64 + CMake)
 
