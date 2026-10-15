@@ -14,6 +14,8 @@ include_directories(include)
 set(RETRO_CORE_SOURCES
     src/scanner.cpp
     src/fingerprint.cpp
+    src/huffman_codec.cpp
+    src/compression_engine.cpp
     src/fixed_chunker.cpp
     src/cdc_chunker.cpp
     src/adaptive_policy.cpp

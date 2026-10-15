@@ -2,5 +2,6 @@ build/
 build-*/
 *.exe
 *.json
+*.rtpack
 collection/
 .vscode/

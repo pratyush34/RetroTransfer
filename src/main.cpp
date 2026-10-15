@@ -1,6 +1,7 @@
 #include "scanner.h"
 #include "chunk_engine.h"
 #include "chunk_config.h"
+#include "compression_engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -89,6 +90,28 @@ static bool normalizeJsonFilename(std::string& filename) {
     return extension == ".json";
 }
 
+static bool normalizePayloadFilename(std::string& filename) {
+    if (filename.empty()) return false;
+
+    const fs::path path(filename);
+    if (path.is_absolute() || path.has_parent_path() ||
+        path.filename() == "." || path.filename() == "..") {
+        return false;
+    }
+
+    if (path.extension().empty()) {
+        filename += ".rtpack";
+        return true;
+    }
+
+    std::string extension = path.extension().string();
+    for (char& character : extension) {
+        character = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character)));
+    }
+    return extension == ".rtpack";
+}
+
 static bool sameOutputPath(const fs::path& first, const fs::path& second) {
     std::string firstName = first.lexically_normal().generic_string();
     std::string secondName = second.lexically_normal().generic_string();
@@ -133,7 +156,8 @@ static fs::path findIdenticalJsonFile(const fs::path& directory,
                 character = static_cast<char>(
                     std::tolower(static_cast<unsigned char>(character)));
             }
-            if (entry.path() != candidate && entry.path() != excludedPath &&
+            if (!sameOutputPath(entry.path(), candidate) &&
+                !sameOutputPath(entry.path(), excludedPath) &&
                 extension == ".json" &&
                 filesHaveSameContents(entry.path(), candidate)) {
                 return entry.path();
@@ -191,7 +215,10 @@ static void writeDirectory(std::ostream& output, const DirectoryNode& directory,
 static void writeChunkManifestJson(std::ofstream& out,
                                    const ProjectChunkResult& result,
                                    const EngineConfig& config,
-                                   const std::string& rootPath) {
+                                   const std::string& rootPath,
+                                   const std::string& baselinePath,
+                                   const std::string& payloadName,
+                                   const CompressionResult* compression) {
     out << "{\n";
     out << "  \"rootPath\": \"" << jsonEscape(rootPath) << "\",\n";
     out << "  \"selectedStrategy\": \"" << strategy_to_string(config.strategy) << "\",\n";
@@ -213,6 +240,48 @@ static void writeChunkManifestJson(std::ofstream& out,
         << result.metrics.overallThroughputMBps << ",\n";
     out << "    \"estimatedMetadataBytes\": " << result.metrics.totalEstimatedMetadataBytes << "\n";
     out << "  },\n";
+    if (compression != nullptr) {
+        const CompressionMetrics& metrics = compression->metrics;
+        out << "  \"selectiveCompression\": {\n";
+        out << "    \"baselineRoot\": \"" << jsonEscape(baselinePath) << "\",\n";
+        out << "    \"payloadFile\": \"" << jsonEscape(payloadName) << "\",\n";
+        out << "    \"payloadFormat\": \"RTPK-v1\",\n";
+        out << "    \"codec\": \"canonical-huffman-per-chunk-with-raw-fallback\",\n";
+        out << "    \"totalChunks\": " << metrics.totalChunks << ",\n";
+        out << "    \"reusableChunks\": " << metrics.reusableChunks << ",\n";
+        out << "    \"missingChunks\": " << metrics.missingChunks << ",\n";
+        out << "    \"duplicateChunks\": " << metrics.duplicateChunks << ",\n";
+        out << "    \"huffmanChunks\": " << metrics.huffmanChunks << ",\n";
+        out << "    \"rawChunks\": " << metrics.storedRawChunks << ",\n";
+        out << "    \"reusableBytes\": " << metrics.reusableBytes << ",\n";
+        out << "    \"duplicateBytesAvoided\": "
+            << metrics.duplicateBytesAvoided << ",\n";
+        out << "    \"totalSourceBytes\": " << metrics.totalSourceBytes << ",\n";
+        out << "    \"selectedInputBytes\": " << metrics.selectedInputBytes << ",\n";
+        out << "    \"uniqueInputBytes\": " << metrics.uniqueInputBytes << ",\n";
+        out << "    \"payloadBytes\": " << metrics.payloadBytes << ",\n";
+        out << "    \"bundleHeaderBytes\": " << metrics.bundleHeaderBytes << ",\n";
+        out << "    \"compressionBytesSaved\": "
+            << metrics.compressionBytesSaved << ",\n";
+        out << "    \"totalBytesAvoided\": " << metrics.totalBytesAvoided << ",\n";
+        out << "    \"payloadChunks\": [\n";
+        for (size_t i = 0; i < compression->payloadChunks.size(); ++i) {
+            const CompressedChunkInfo& chunk = compression->payloadChunks[i];
+            out << "      {\"path\": \"" << jsonEscape(chunk.metadata.relativePath)
+                << "\", \"seq\": " << chunk.metadata.sequenceNumber
+                << ", \"fingerprint\": \"" << chunk.metadata.fingerprint
+                << "\", \"sourceOffset\": " << chunk.metadata.offset
+                << ", \"originalSize\": " << chunk.metadata.length
+                << ", \"payloadOffset\": " << chunk.payloadOffset
+                << ", \"storedSize\": " << chunk.storedSize
+                << ", \"codec\": \"" << chunk.codec
+                << "\", \"crc32\": " << chunk.metadata.crc32 << "}";
+            if (i + 1 < compression->payloadChunks.size()) out << ",";
+            out << "\n";
+        }
+        out << "    ]\n";
+        out << "  },\n";
+    }
 
     out << "  \"files\": [\n";
     for (size_t i = 0; i < result.files.size(); ++i) {
@@ -258,6 +327,8 @@ static void printUsage(const char* progName) {
     std::cout << "Options:\n";
     std::cout << "  --scan-output <name>  Scan JSON filename (default: \"scan.json\")\n";
     std::cout << "  --chunks-output <name> Chunk manifest filename (default: <scan>_chunks.json)\n";
+    std::cout << "  --baseline <directory> Compare against a local receiver/project copy\n";
+    std::cout << "  --payload-output <name> Compressed missing-chunk bundle (requires --baseline)\n";
     std::cout << "  --strategy, -s <mode> Chunking strategy: \"adaptive\" (default), \"fixed\", or \"cdc\"\n";
     std::cout << "  --chunk-size <bytes>  Fixed chunk size in bytes (default: 65536)\n";
     std::cout << "  --min-chunk <bytes>   CDC minimum chunk size (default: 16384)\n";
@@ -339,8 +410,11 @@ int main(int argc, char* argv[]) {
     std::string path = ".";
     std::string scanOutputName = "scan.json";
     std::string chunksOutputName;
+    std::string baselinePath;
+    std::string payloadOutputName;
     bool scanOutputSpecified = false;
     bool chunksOutputSpecified = false;
+    bool payloadOutputSpecified = false;
     bool enableChunking = true;
     bool benchmarkMode = false;
 
@@ -357,6 +431,23 @@ int main(int argc, char* argv[]) {
             enableChunking = false;
         } else if (arg == "--benchmark") {
             benchmarkMode = true;
+        } else if (arg == "--baseline") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --baseline requires a directory path.\n";
+                return 2;
+            }
+            baselinePath = argv[++i];
+        } else if (arg == "--payload-output") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --payload-output requires a .rtpack filename.\n";
+                return 2;
+            }
+            payloadOutputName = argv[++i];
+            if (!normalizePayloadFilename(payloadOutputName)) {
+                std::cerr << "Error: --payload-output requires a .rtpack filename without a directory.\n";
+                return 2;
+            }
+            payloadOutputSpecified = true;
         } else if (arg == "--scan-output" || arg == "--chunks-output") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: " << arg << " requires a JSON filename.\n";
@@ -443,10 +534,28 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
+    if (!baselinePath.empty() && !enableChunking) {
+        std::cerr << "Error: --baseline requires chunking; remove --no-chunk.\n";
+        return 2;
+    }
+    if (payloadOutputSpecified && baselinePath.empty()) {
+        std::cerr << "Error: --payload-output requires --baseline.\n";
+        return 2;
+    }
+
     std::error_code rootError;
     if (!fs::exists(path, rootError) || rootError || !fs::is_directory(path, rootError) || rootError) {
         std::cerr << "Error: Scan root is not an accessible directory: " << path << "\n";
         return 1;
+    }
+    if (!baselinePath.empty()) {
+        rootError.clear();
+        if (!fs::exists(baselinePath, rootError) || rootError ||
+            !fs::is_directory(baselinePath, rootError) || rootError) {
+            std::cerr << "Error: Baseline is not an accessible directory: "
+                      << baselinePath << "\n";
+            return 1;
+        }
     }
 
     const fs::path collectionFolder = "collection";
@@ -455,8 +564,18 @@ int main(int argc, char* argv[]) {
         chunksOutputName = outputPath.stem().string() + "_chunks.json";
     }
     const fs::path chunkOutputPath = collectionFolder / chunksOutputName;
+    if (!baselinePath.empty() && !payloadOutputSpecified) {
+        payloadOutputName = outputPath.stem().string() + "_payload.rtpack";
+    }
+    const fs::path payloadOutputPath = collectionFolder / payloadOutputName;
     if (enableChunking && sameOutputPath(outputPath, chunkOutputPath)) {
         std::cerr << "Error: Scan and chunk manifest filenames must be different.\n";
+        return 2;
+    }
+    if (enableChunking && !baselinePath.empty() &&
+        (sameOutputPath(outputPath, payloadOutputPath) ||
+         sameOutputPath(chunkOutputPath, payloadOutputPath))) {
+        std::cerr << "Error: Payload filename must differ from scan and chunk manifest filenames.\n";
         return 2;
     }
 
@@ -517,13 +636,48 @@ int main(int argc, char* argv[]) {
         ChunkEngine engine(config);
         ProjectChunkResult chunkResult = engine.processScannedProject(directoryTree, path);
 
+        CompressionResult compressionResult;
+        const CompressionResult* compression = nullptr;
+        if (!baselinePath.empty()) {
+            std::cout << "[Stage 3/3] Comparing baseline chunks and compressing missing chunks...\n";
+            ProjectScanner baselineScanner(baselinePath);
+            const DirectoryNode baselineTree = baselineScanner.scan();
+            const ProjectChunkResult baselineResult =
+                engine.processScannedProject(baselineTree, baselinePath);
+
+            CompressionEngine compressor;
+            std::string compressionError;
+            if (!compressor.compressMissingChunks(chunkResult, baselineResult,
+                                                  payloadOutputPath.string(),
+                                                  compressionResult,
+                                                  compressionError)) {
+                std::cerr << "Error: Selective compression failed: "
+                          << compressionError << "\n";
+                return 1;
+            }
+            compression = &compressionResult;
+            const CompressionMetrics& metrics = compressionResult.metrics;
+            std::cout << "Reusable chunks    : " << metrics.reusableChunks << "\n";
+            std::cout << "Missing chunks     : " << metrics.missingChunks << "\n";
+            std::cout << "Repeated missing   : " << metrics.duplicateChunks
+                      << " (" << metrics.duplicateBytesAvoided << " bytes omitted)\n";
+            std::cout << "Huffman / raw      : " << metrics.huffmanChunks << " / "
+                      << metrics.storedRawChunks << "\n";
+            std::cout << "Compression saved  : "
+                      << metrics.compressionBytesSaved << " bytes\n";
+            std::cout << "Total bytes avoided: " << metrics.totalBytesAvoided
+                      << " bytes\n";
+            std::cout << "Saved payload      : " << payloadOutputPath << "\n";
+        }
+
         // Save chunk manifest
         std::ofstream chunkOut(chunkOutputPath);
         if (!chunkOut) {
             std::cerr << "Error: Could not create chunk manifest: " << chunkOutputPath << "\n";
             return 1;
         }
-        writeChunkManifestJson(chunkOut, chunkResult, config, path);
+        writeChunkManifestJson(chunkOut, chunkResult, config, path, baselinePath,
+                               payloadOutputName, compression);
         chunkOut.close();
         if (!chunkOut) {
             std::cerr << "Error: Failed while writing chunk manifest: " << chunkOutputPath << "\n";

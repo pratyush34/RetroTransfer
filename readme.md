@@ -10,17 +10,32 @@ Pratyush
 $env:Path = "C:\msys64\ucrt64\bin;C:\MinGW\bin;C:\Program Files\CMake\bin;$env:Path"
 
 # Configure a fresh build directory and build
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 cmake -S . -B build-ucrt64 -G "MinGW Makefiles" `
   -DCMAKE_C_COMPILER="C:\msys64\ucrt64\bin\gcc.exe" `
   -DCMAKE_CXX_COMPILER="C:\msys64\ucrt64\bin\g++.exe" `
   -DCMAKE_MAKE_PROGRAM="C:\MinGW\bin\mingw32-make.exe"
 cmake --build build-ucrt64 --parallel
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+$env:PATH = 'C:\msys64\ucrt64\bin;C:\msys64\usr\bin;' + $env:PATH
+cmake --build build-ucrt64 --parallel
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Run project scan and adaptive chunking on current directory
 .\build-ucrt64\RetroTransfer.exe .
 
 # Run automated test suite
 ctest --test-dir build-ucrt64 --output-on-failure
+```
+
+#Scan , chunk and compare
+
+```powershell
+.\build-ucrt64\RetroTransfer.exe "C:\Projects\MyProject-v2" `
+  --baseline "C:\Projects\MyProject-v1" `
+  --scan-output v2-scan.json `
+  --chunks-output v2-chunks.json `
+  --payload-output v2-missing.rtpack
 ```
 
 The scan is saved as JSON in the `collection` folder by default:
@@ -46,9 +61,7 @@ Each saved JSON file contains a directory tree. Every directory has `name`, `pat
 
 ## 1. Project Overview
 
-**RetroTransfer** is an incremental project-transfer system designed to transfer software repositories and evolving directories over high-latency or constrained network links with minimal redundant data transmission.
-
-RetroTransfer is being developed to reduce retransmission of unchanged content across project revisions. This branch implements directory scanning, fixed and content-defined chunking, chunk fingerprints, metrics, and JSON manifests. Persistent deduplication, compression, socket transfer, and reconstruction are planned stages and are not implemented yet.
+**RetroTransfer** reduces redundant data in evolving projects. It scans and chunks a current project, can compare its chunks with a locally available baseline project, and writes a bundle containing only missing chunks. Missing chunks are encoded with canonical Huffman coding when that makes them smaller; otherwise they are stored raw. Network transfer, persistent receiver storage, and project reconstruction are not implemented.
 
 ### System Pipeline Roadmap
 
@@ -56,16 +69,16 @@ RetroTransfer is being developed to reduce retransmission of unchanged content a
 flowchart LR
     A["Project Scanner<br/>(Implemented)"] --> B["Chunking Engine<br/>(Implemented)"]
     B --> C["Fingerprinting<br/>(Implemented)"]
-    C --> D["Deduplication Engine<br/>(Planned - C Hash Table)"]
-    D --> E["Manifest Generation<br/>(Implemented / Planned)"]
-    E --> F["Compression<br/>(Planned - RLE/Huffman/LZW)"]
+    C --> D["Local Baseline Deduplication<br/>(Implemented - hash lookup + byte verification)"]
+    D --> E["Selective Compression<br/>(Implemented - Huffman)"]
+    E --> F["Payload Bundle + Manifest<br/>(Implemented)"]
     F --> G["TCP Socket Transfer<br/>(Planned - Winsock/POSIX)"]
     G --> H["Reconstruction & Verification<br/>(Planned - CRC32)"]
 ```
 
 > [!NOTE]
-> Stages currently implemented: **Project Scanner**, **Chunking Engine** (Fixed & CDC), **Chunk Fingerprinting** (MurmurHash3 128-bit & CRC32), **Workload-Aware Adaptive Chunking Policy**, and **Automated Verification Tests**.
-> Stages planned for subsequent development: C-based Hash Table Deduplication, RLE/Huffman/LZW Compression, TCP Sockets, and Reconstruction.
+> Stages currently implemented: **Project Scanner**, **Chunking Engine** (Fixed & CDC), **Chunk Fingerprinting** (MurmurHash3 128-bit & CRC32), **Workload-Aware Adaptive Chunking**, **local baseline comparison with byte verification**, **per-chunk Huffman compression with raw fallback**, and **a local payload bundle plus JSON manifest**.
+> Stages not implemented: persistent receiver chunk storage, TCP/local-network transfer, resumable transfer, receiver-side decompression, and project reconstruction.
 
 ---
 
@@ -84,7 +97,10 @@ flowchart TD
     Stream1 --> FP["Fingerprinting (MurmurHash3 128-bit + CRC32)"]
     Stream2 --> FP
     FP --> Meta["ChunkMetadata Vector & Performance Metrics"]
-    Meta --> Manifest["JSON Manifest (collection/*_chunks.json)"]
+    Meta --> Compare["Compare against local baseline fingerprints + bytes"]
+    Compare -->|Missing chunks only| Huffman["Canonical Huffman, raw fallback"]
+    Compare -->|Already available| Reuse["Record as reusable; do not store again"]
+    Huffman --> Bundle["Local RTPK payload bundle + JSON manifest"]
 ```
 
 ---
@@ -144,8 +160,7 @@ Raw bytes can be retrieved on demand at any time using:
   - High-throughput non-cryptographic hashing. Actual throughput depends on hardware, compiler, and input size.
   - Handles arbitrary binary streams and embedded null bytes correctly.
 - **Collision Safety**:
-  - MurmurHash3 is non-cryptographic, so its fingerprint must not be treated as a security guarantee.
-  - `readChunkPayload` can reread bytes for comparison, but the deduplication/transfer engine is not implemented yet. `compareVersions` currently compares fingerprints only; do not use its matches as a collision-proof transfer decision.
+  - MurmurHash3 is non-cryptographic. Local baseline reuse therefore requires both a matching fingerprint and byte-for-byte equality; fingerprints alone are not treated as proof.
 - **CRC32 Checksum**:
   - Standard IEEE 802.3 CRC32 polynomial (`0xEDB88320`) computed for every chunk to detect transport bit corruption.
 
@@ -167,7 +182,24 @@ Every file decision records its rationale string in the JSON manifest for audita
 
 ---
 
-## 7. CLI Usage & Options
+## 7. Selective Compression (local baseline mode)
+
+Pass `--baseline <folder>` to simulate the receiver having an earlier project copy. RetroTransfer scans and chunks both folders with the same selected chunk strategy and configuration. For each current chunk it:
+
+1. Looks up matching baseline fingerprints.
+2. Confirms candidate matches by comparing the actual bytes.
+3. Marks exact matches reusable and does not write them to the payload.
+4. Checks missing chunks against earlier missing chunks in this project and stores repeated data only once.
+5. Huffman-encodes unique missing chunks; if the encoded form is not smaller, stores that chunk raw instead.
+6. Writes a local `.rtpack` file and adds each payload offset, codec, fingerprint, source offset, and size to the chunk JSON manifest.
+
+This is **local selective packaging**, not network transfer. The baseline is rescanned on every run; no persistent receiver index is written. The current file/chunk manifest still describes all current chunks, while `selectiveCompression.payloadChunks` lists only unique missing payload entries. Metrics distinguish chunks missing from the baseline (`missingChunks`) from repeated current-project chunks omitted from storage (`duplicateChunks`). `compressionBytesSaved` measures savings from encoding unique missing input; `totalBytesAvoided` compares all current source bytes with the actual payload plus its header. The RTPK file is a temporary hand-off artifact for the future transfer stage; there is not yet a receiver-side decoder or reconstruction command.
+
+The Huffman codec stores a canonical code-length table for each encoded chunk. Chunk payloads that cannot be reduced are stored raw. Huffman is lossless; tests exercise the codec decoder to verify round-trips, but a project-level restore feature is not yet provided.
+
+---
+
+## 8. CLI Usage & Options
 
 The command syntax supports legacy positional arguments and named output options:
 
@@ -177,6 +209,9 @@ The command syntax supports legacy positional arguments and named output options
 
 # Give the scan and chunk manifest independent names (inside collection/)
 ./RetroTransfer . --scan-output project-scan --chunks-output project-chunks.json
+
+# Compare a new project against an earlier local copy and package only missing chunks
+./RetroTransfer "C:\projects\MyProject-v2" --baseline "C:\projects\MyProject-v1" --payload-output v2-missing.rtpack
 
 # Select chunking strategy explicitly
 ./RetroTransfer . --scan-output scan.json --strategy fixed --chunk-size 32768
@@ -194,18 +229,20 @@ The command syntax supports legacy positional arguments and named output options
 ```
 
 `--scan-output` defaults to `scan.json`; `--chunks-output` defaults to the scan
-name with `_chunks.json` appended. Either option accepts a filename with or
-without the `.json` extension; output names cannot include a directory. Exact
-duplicate scan contents are not written under a second filename. Existing JSON
-files are kept, and explicitly selected output files may be overwritten.
+name with `_chunks.json` appended. With `--baseline`, `--payload-output` defaults
+to `<scan-name>_payload.rtpack`. JSON options accept a filename with or without
+`.json`; the payload option accepts a name with or without `.rtpack`. Output names
+cannot include a directory and are saved in `collection`. Exact duplicate scan
+contents are not written under a second filename. Existing JSON files are kept,
+and explicitly selected output files may be overwritten.
 
 Chunk-size arguments must be positive integers no larger than 1 GiB. Invalid or inconsistent sizes are rejected before scanning.
 
 ---
 
-## 8. Automated Testing
+## 9. Automated Testing
 
-RetroTransfer includes a dedicated CTest suite covering 23 edge cases:
+RetroTransfer includes a dedicated CTest suite covering chunking, scanning, adaptive policy, and compression behavior:
 
 ```bash
 ctest --test-dir build --output-on-failure
@@ -213,7 +250,7 @@ ctest --test-dir build --output-on-failure
 ./build/test_chunking.exe
 ```
 
-### Verified Test Cases:
+### Covered Test Cases:
 1. `test_empty_file` (0 bytes $\to$ 0 chunks, no empty chunk)
 2. `test_one_byte_file` (1 byte $\to$ 1 chunk of length 1)
 3. `test_smaller_than_chunk_size` (sub-chunk handling)
@@ -237,10 +274,12 @@ ctest --test-dir build --output-on-failure
 21. `test_payload_reread_and_byte_comparison` (rereads bytes and compares them directly)
 22. `test_version_comparison_metrics` (reusable bytes & reuse ratio calculation)
 23. `test_crc32_standard_vector` (validates the standard CRC32 result for `123456789`)
+24. `test_huffman_round_trip` (binary and empty-input Huffman encode/decode)
+25. `test_selective_huffman_compression` (baseline reuse, missing chunk selection, bundle read and Huffman round-trip)
 
 ---
 
-## 9. Benchmark & Example Results
+## 10. Benchmark & Example Results
 
 Running `./RetroTransfer . scan.json --benchmark` prints a comparative summary. The following numbers are an illustrative example, not a performance guarantee; results depend on the project, hardware, and configuration:
 
@@ -259,17 +298,19 @@ adaptive    23        23          0.0%        9.73          11.29             3
 Output manifests:
 - `collection/scan.json`: Directory hierarchy (unchanged scanner output format)
 - `collection/scan_chunks.json`: Full chunk manifest, fingerprints, adaptive rationale, and metrics
+- `collection/scan_payload.rtpack`: Created only with `--baseline`; contains missing chunk bytes, Huffman-coded where smaller and raw otherwise
 
 ---
 
-## 10. Current Limitations & Next Steps
+## 11. Current Limitations & Next Steps
 
 ### Current Limitations:
 - The adaptive policy currently uses file extension and size heuristics; it does not yet profile runtime Shannon entropy per block.
-- Deduplication ratio is currently reported across chunks within the scanned project baseline; multi-host transfer history will be added in the deduplication engine stage.
+- Baseline chunks are rescanned for each run; there is no persistent receiver chunk index.
+- The bundle and manifest are local artifacts only. Network transfer, resume, receiver-side decompression, and reconstruction are not implemented.
+- Compression is per chunk and currently uses canonical Huffman coding with raw fallback. RLE/LZW and a measured algorithm selector are not implemented.
 
 ### Recommended Next Steps for Deduplication Stage:
-1. **C Hash Table**: Implement an open-addressing or chained hash table keyed on the 128-bit `Fingerprint128` structs.
-2. **Chunk Index / Store**: Map fingerprints to disk locations (`filePath`, `offset`, `length`).
-3. **Candidate Verification**: Read payloads via `readChunkPayload` to confirm zero false-positive collisions before flagging chunks as reusable.
-4. **Delta Manifest**: Output a transfer manifest containing only *new* chunks alongside a recipe for reconstructing identical files at the receiver.
+1. **Persistent receiver index**: Store receiver chunk fingerprints and locations between runs instead of rescanning the baseline folder.
+2. **Transfer protocol**: Send the manifest and RTPK payload over local Wi-Fi/LAN, with acknowledgement and resume support.
+3. **Receiver decode and reconstruction**: Validate chunk CRCs, decode Huffman-coded chunks, and reconstruct the project tree from a recipe.

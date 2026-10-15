@@ -7,6 +7,8 @@
 #include "cdc_chunker.h"
 #include "adaptive_policy.h"
 #include "chunk_engine.h"
+#include "huffman_codec.h"
+#include "compression_engine.h"
 
 #include <cassert>
 #include <cstring>
@@ -596,6 +598,155 @@ static void test_version_comparison_metrics() {
     TEST_ASSERT(comp.reuseRatio > 0.66 && comp.reuseRatio < 0.67, "Reuse ratio should be approx 66.7%");
 }
 
+static void test_huffman_round_trip() {
+    std::vector<uint8_t> input;
+    input.reserve(12000);
+    for (size_t i = 0; i < 12000; ++i) {
+        input.push_back(static_cast<uint8_t>((i * 37 + i / 11) & 0xff));
+    }
+
+    std::vector<uint8_t> encoded;
+    std::vector<uint8_t> decoded;
+    std::string error;
+    TEST_ASSERT(HuffmanCodec::compress(input, encoded, error),
+                "Huffman compressor rejected valid binary data");
+    TEST_ASSERT(HuffmanCodec::decompress(encoded, input.size(), decoded, error),
+                "Huffman decompressor rejected its own output");
+    TEST_ASSERT(decoded == input, "Huffman round-trip changed input bytes");
+
+    const std::vector<uint8_t> empty;
+    TEST_ASSERT(HuffmanCodec::compress(empty, encoded, error),
+                "Huffman compressor rejected empty input");
+    TEST_ASSERT(HuffmanCodec::decompress(encoded, 0, decoded, error) && decoded.empty(),
+                "Empty Huffman stream did not round-trip");
+}
+
+static void test_selective_huffman_compression() {
+    setupTestDir();
+    fs::create_directories(TEST_DIR / "baseline");
+    fs::create_directories(TEST_DIR / "current");
+
+    std::vector<uint8_t> shared(4096, 'A');
+    std::vector<uint8_t> added(4096, 'B');
+    std::vector<uint8_t> noisy(4096);
+    for (size_t i = 0; i < noisy.size(); ++i) {
+        noisy[i] = static_cast<uint8_t>(i & 0xff);
+    }
+    createTestFile("baseline/shared.txt", shared);
+    createTestFile("current/shared.txt", shared);
+    createTestFile("current/added.txt", added);
+    createTestFile("current/noise.bin", noisy);
+
+    EngineConfig config;
+    config.strategy = ChunkStrategy::Fixed;
+    config.fixedConfig.chunkSize = shared.size();
+    ChunkEngine engine(config);
+
+    ProjectScanner baselineScanner((TEST_DIR / "baseline").string());
+    ProjectScanner currentScanner((TEST_DIR / "current").string());
+    const ProjectChunkResult baseline = engine.processScannedProject(
+        baselineScanner.scan(), (TEST_DIR / "baseline").string());
+    const ProjectChunkResult current = engine.processScannedProject(
+        currentScanner.scan(), (TEST_DIR / "current").string());
+
+    CompressionEngine compressor;
+    CompressionResult result;
+    std::string error;
+    const fs::path payloadPath = TEST_DIR / "selected.rtpack";
+    TEST_ASSERT(compressor.compressMissingChunks(current, baseline,
+                                                 payloadPath.string(), result, error),
+                "Selective compression failed");
+    TEST_ASSERT(result.metrics.totalChunks == 3, "Unexpected current chunk count");
+    TEST_ASSERT(result.metrics.reusableChunks == 1,
+                "Identical baseline chunk should be marked reusable");
+    TEST_ASSERT(result.metrics.missingChunks == 2,
+                "Only the absent chunks should be written");
+    TEST_ASSERT(result.metrics.huffmanChunks == 1,
+                "Compressible missing chunk should use Huffman");
+    TEST_ASSERT(result.metrics.storedRawChunks == 1,
+                "Incompressible missing chunk should use raw storage");
+    TEST_ASSERT(result.payloadChunks.size() == 2,
+                "Payload bundle should contain only missing chunks");
+
+    std::ifstream payload(payloadPath, std::ios::binary);
+    char header[8] = {};
+    payload.read(header, sizeof(header));
+    TEST_ASSERT(payload && std::string(header, header + 4) == "RTPK",
+                "Payload bundle header is invalid");
+    for (const CompressedChunkInfo& chunk : result.payloadChunks) {
+        payload.clear();
+        payload.seekg(static_cast<std::streamoff>(chunk.payloadOffset));
+        std::vector<uint8_t> stored(static_cast<size_t>(chunk.storedSize));
+        payload.read(reinterpret_cast<char*>(stored.data()),
+                     static_cast<std::streamsize>(stored.size()));
+        TEST_ASSERT(payload.gcount() == static_cast<std::streamsize>(stored.size()),
+                    "Could not read selected chunk from payload bundle");
+
+        std::vector<uint8_t> decoded;
+        if (chunk.codec == "huffman") {
+            TEST_ASSERT(HuffmanCodec::decompress(stored, chunk.metadata.length,
+                                                 decoded, error),
+                        "Could not decode selected Huffman chunk");
+        } else {
+            TEST_ASSERT(chunk.codec == "raw", "Unknown selected chunk codec");
+            decoded = stored;
+        }
+        const std::vector<uint8_t>& expected =
+            chunk.metadata.relativePath == "added.txt" ? added : noisy;
+        TEST_ASSERT(decoded == expected,
+                    "Decoded selected chunk differs from its source");
+    }
+}
+
+static void test_selective_compression_deduplicates_current_chunks() {
+    setupTestDir();
+    fs::create_directories(TEST_DIR / "baseline");
+    fs::create_directories(TEST_DIR / "current");
+
+    const std::vector<uint8_t> repeated(4096, 'R');
+    createTestFile("current/first.bin", repeated);
+    createTestFile("current/second.bin", repeated);
+
+    EngineConfig config;
+    config.strategy = ChunkStrategy::Fixed;
+    config.fixedConfig.chunkSize = repeated.size();
+    ChunkEngine engine(config);
+
+    ProjectScanner baselineScanner((TEST_DIR / "baseline").string());
+    ProjectScanner currentScanner((TEST_DIR / "current").string());
+    const ProjectChunkResult baseline = engine.processScannedProject(
+        baselineScanner.scan(), (TEST_DIR / "baseline").string());
+    const ProjectChunkResult current = engine.processScannedProject(
+        currentScanner.scan(), (TEST_DIR / "current").string());
+
+    CompressionEngine compressor;
+    CompressionResult result;
+    std::string error;
+    const fs::path payloadPath = TEST_DIR / "duplicates.rtpack";
+    TEST_ASSERT(compressor.compressMissingChunks(current, baseline,
+                                                 payloadPath.string(), result, error),
+                "Selective compression with duplicate chunks failed");
+    TEST_ASSERT(result.metrics.totalChunks == 2,
+                "Both current chunks should be counted");
+    TEST_ASSERT(result.metrics.missingChunks == 2,
+                "Both chunks are absent from the baseline");
+    TEST_ASSERT(result.metrics.duplicateChunks == 1,
+                "One repeated missing chunk should be deduplicated");
+    TEST_ASSERT(result.metrics.duplicateBytesAvoided == repeated.size(),
+                "Repeated chunk bytes were not counted as avoided");
+    TEST_ASSERT(result.metrics.uniqueInputBytes == repeated.size(),
+                "Only one copy should be compressed");
+    TEST_ASSERT(result.payloadChunks.size() == 1,
+                "Payload should contain one copy of repeated chunk data");
+    TEST_ASSERT(result.metrics.totalSourceBytes == repeated.size() * 2,
+                "Source byte total should include both chunks");
+    TEST_ASSERT(result.metrics.totalBytesAvoided ==
+                    result.metrics.totalSourceBytes -
+                        result.metrics.payloadBytes -
+                        result.metrics.bundleHeaderBytes,
+                "Total bytes avoided should account for bundle contents");
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << "   RETROTRANSFER CHUNKING ENGINE TESTS  \n";
@@ -626,6 +777,9 @@ int main() {
     RUN_TEST(test_explicit_mode_overrides);
     RUN_TEST(test_payload_reread_and_byte_comparison);
     RUN_TEST(test_version_comparison_metrics);
+    RUN_TEST(test_huffman_round_trip);
+    RUN_TEST(test_selective_huffman_compression);
+    RUN_TEST(test_selective_compression_deduplicates_current_chunks);
 
     cleanupTestDir();
 
