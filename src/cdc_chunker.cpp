@@ -1,5 +1,5 @@
 #include "cdc_chunker.h"
-#include "fingerprint.h"
+#include "fingerprint_c.h"
 
 #include <algorithm>
 #include <array>
@@ -97,8 +97,10 @@ bool CDCChunker::chunkFile(const std::string& fullPath,
         totalBytes += chunkSize;
 
         auto fpStart = std::chrono::steady_clock::now();
-        std::string fp = compute_fingerprint_hex(chunkData, chunkSize);
-        uint32_t crc = compute_crc32(chunkData, chunkSize);
+        char fingerprint[33];
+        rt_compute_fingerprint_hex(chunkData, chunkSize, 42, fingerprint);
+        std::string fp(fingerprint);
+        uint32_t crc = rt_compute_crc32(chunkData, chunkSize);
         auto fpEnd = std::chrono::steady_clock::now();
         totalFpDurationMs += std::chrono::duration<double, std::milli>(fpEnd - fpStart).count();
 
@@ -225,8 +227,10 @@ bool CDCChunker::chunkBuffer(const uint8_t* buffer,
         }
 
         auto fpStart = std::chrono::steady_clock::now();
-        std::string fp = compute_fingerprint_hex(chunkData, chunkSize);
-        uint32_t crc = compute_crc32(chunkData, chunkSize);
+        char fingerprint[33];
+        rt_compute_fingerprint_hex(chunkData, chunkSize, 42, fingerprint);
+        std::string fp(fingerprint);
+        uint32_t crc = rt_compute_crc32(chunkData, chunkSize);
         auto fpEnd = std::chrono::steady_clock::now();
         totalFpDurationMs += std::chrono::duration<double, std::milli>(fpEnd - fpStart).count();
 

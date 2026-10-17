@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 
-project(RetroTransfer VERSION 1.0)
+project(RetroTransfer VERSION 1.0 LANGUAGES C CXX)
 
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED True)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
@@ -13,8 +15,9 @@ include_directories(include)
 
 set(RETRO_CORE_SOURCES
     src/scanner.cpp
-    src/fingerprint.cpp
-    src/huffman_codec.cpp
+    src/fingerprint.c
+    src/huffman_codec.c
+    src/compression_engine.c
     src/compression_engine.cpp
     src/fixed_chunker.cpp
     src/cdc_chunker.cpp

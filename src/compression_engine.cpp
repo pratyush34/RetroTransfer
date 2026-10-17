@@ -1,55 +1,12 @@
 #include "compression_engine.h"
 
-#include "fingerprint.h"
-#include "huffman_codec.h"
+#include "compression_engine_c.h"
 
 #include <filesystem>
-#include <fstream>
-#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
-
-namespace {
-
-struct ChunkLocation {
-    const FileChunkResult* file;
-    const ChunkMetadata* chunk;
-};
-
-bool matchesChunkInIndex(
-    const ChunkMetadata& candidate,
-    const std::vector<uint8_t>& candidateBytes,
-    const std::unordered_map<std::string,
-                             std::vector<ChunkLocation>>& index,
-    std::string& error) {
-    const auto found = index.find(candidate.fingerprint);
-    if (found == index.end()) return false;
-
-    for (const ChunkLocation& location : found->second) {
-        if (location.chunk->length != candidate.length) continue;
-
-        std::vector<uint8_t> baselineBytes;
-        if (!ChunkEngine::readChunkPayload(location.file->fileInfo.filePath,
-                                           location.chunk->offset,
-                                           location.chunk->length,
-                                           baselineBytes)) {
-            error = "Could not reread baseline chunk: " +
-                    location.file->fileInfo.filePath;
-            return false;
-        }
-        if (candidateBytes == baselineBytes) return true;
-    }
-    return false;
-}
-
-bool writeBytes(std::ofstream& output, const std::vector<uint8_t>& bytes) {
-    if (bytes.empty()) return true;
-    output.write(reinterpret_cast<const char*>(bytes.data()),
-                 static_cast<std::streamsize>(bytes.size()));
-    return static_cast<bool>(output);
-}
-
-} // namespace
 
 bool CompressionEngine::compressMissingChunks(const ProjectChunkResult& current,
                                                const ProjectChunkResult& baseline,
@@ -59,11 +16,30 @@ bool CompressionEngine::compressMissingChunks(const ProjectChunkResult& current,
     result = {};
     error.clear();
 
-    std::unordered_map<std::string, std::vector<ChunkLocation>> baselineIndex;
-    std::unordered_map<std::string, std::vector<ChunkLocation>> payloadIndex;
+    std::vector<RtCompressionChunk> currentChunks;
+    std::vector<RtCompressionChunk> baselineChunks;
+    std::vector<const ChunkMetadata*> currentMetadata;
+    for (const FileChunkResult& file : current.files) {
+        for (const ChunkMetadata& chunk : file.chunks) {
+            currentChunks.push_back({file.fileInfo.filePath.c_str(),
+                                     file.relativePath.c_str(),
+                                     chunk.fingerprint.c_str(),
+                                     chunk.offset,
+                                     chunk.length,
+                                     chunk.sequenceNumber,
+                                     chunk.crc32});
+            currentMetadata.push_back(&chunk);
+        }
+    }
     for (const FileChunkResult& file : baseline.files) {
         for (const ChunkMetadata& chunk : file.chunks) {
-            baselineIndex[chunk.fingerprint].push_back({&file, &chunk});
+            baselineChunks.push_back({file.fileInfo.filePath.c_str(),
+                                      file.relativePath.c_str(),
+                                      chunk.fingerprint.c_str(),
+                                      chunk.offset,
+                                      chunk.length,
+                                      chunk.sequenceNumber,
+                                      chunk.crc32});
         }
     }
 
@@ -77,108 +53,41 @@ bool CompressionEngine::compressMissingChunks(const ProjectChunkResult& current,
         }
     }
 
-    std::ofstream output(payloadPath, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        error = "Could not create compressed payload: " + payloadPath;
+    RtCompressionResult cResult{};
+    char errorBuffer[1024] = {};
+    if (!rt_compress_missing_chunks(currentChunks.data(), currentChunks.size(),
+                                    baselineChunks.data(), baselineChunks.size(),
+                                    payloadPath.c_str(), &cResult,
+                                    errorBuffer, sizeof(errorBuffer))) {
+        error = errorBuffer;
         return false;
     }
 
-    static constexpr char header[] = {'R', 'T', 'P', 'K', 1, 0, 0, 0};
-    output.write(header, sizeof(header));
-    if (!output) {
-        error = "Could not write compressed payload header: " + payloadPath;
-        return false;
+    result.metrics.totalChunks = cResult.metrics.total_chunks;
+    result.metrics.reusableChunks = cResult.metrics.reusable_chunks;
+    result.metrics.missingChunks = cResult.metrics.missing_chunks;
+    result.metrics.duplicateChunks = cResult.metrics.duplicate_chunks;
+    result.metrics.huffmanChunks = cResult.metrics.huffman_chunks;
+    result.metrics.storedRawChunks = cResult.metrics.stored_raw_chunks;
+    result.metrics.reusableBytes = cResult.metrics.reusable_bytes;
+    result.metrics.duplicateBytesAvoided = cResult.metrics.duplicate_bytes_avoided;
+    result.metrics.totalSourceBytes = cResult.metrics.total_source_bytes;
+    result.metrics.selectedInputBytes = cResult.metrics.selected_input_bytes;
+    result.metrics.uniqueInputBytes = cResult.metrics.unique_input_bytes;
+    result.metrics.payloadBytes = cResult.metrics.payload_bytes;
+    result.metrics.bundleHeaderBytes = cResult.metrics.bundle_header_bytes;
+    result.metrics.compressionBytesSaved = cResult.metrics.compression_bytes_saved;
+    result.metrics.totalBytesAvoided = cResult.metrics.total_bytes_avoided;
+    result.payloadChunks.reserve(cResult.chunk_count);
+    for (size_t i = 0; i < cResult.chunk_count; ++i) {
+        const RtCompressedChunk& compressed = cResult.chunks[i];
+        CompressedChunkInfo info;
+        info.metadata = *currentMetadata[compressed.current_index];
+        info.payloadOffset = compressed.payload_offset;
+        info.storedSize = compressed.stored_size;
+        info.codec = compressed.uses_huffman ? "huffman" : "raw";
+        result.payloadChunks.push_back(std::move(info));
     }
-
-    for (const FileChunkResult& file : current.files) {
-        for (const ChunkMetadata& chunk : file.chunks) {
-            ++result.metrics.totalChunks;
-            result.metrics.totalSourceBytes += chunk.length;
-            std::vector<uint8_t> raw;
-            if (!ChunkEngine::readChunkPayload(file.fileInfo.filePath, chunk.offset,
-                                               chunk.length, raw)) {
-                error = "Could not reread source chunk: " + file.fileInfo.filePath;
-                return false;
-            }
-            if (compute_fingerprint_hex(raw.data(), raw.size()) != chunk.fingerprint ||
-                compute_crc32(raw.data(), raw.size()) != chunk.crc32) {
-                error = "Source chunk changed after scanning: " + file.relativePath +
-                        " chunk " + std::to_string(chunk.sequenceNumber);
-                return false;
-            }
-
-            const bool foundInBaseline =
-                matchesChunkInIndex(chunk, raw, baselineIndex, error);
-            if (!error.empty()) return false;
-            if (foundInBaseline) {
-                ++result.metrics.reusableChunks;
-                result.metrics.reusableBytes += chunk.length;
-                continue;
-            }
-
-            ++result.metrics.missingChunks;
-            result.metrics.selectedInputBytes += chunk.length;
-            const bool foundInPayload =
-                matchesChunkInIndex(chunk, raw, payloadIndex, error);
-            if (!error.empty()) return false;
-            if (foundInPayload) {
-                ++result.metrics.duplicateChunks;
-                result.metrics.duplicateBytesAvoided += chunk.length;
-                continue;
-            }
-
-            std::vector<uint8_t> encoded;
-            if (!HuffmanCodec::compress(raw, encoded, error)) {
-                error = "Could not Huffman-compress " + file.relativePath +
-                        " chunk " + std::to_string(chunk.sequenceNumber) + ": " + error;
-                return false;
-            }
-
-            const bool useHuffman = encoded.size() < raw.size();
-            const std::vector<uint8_t>& payload = useHuffman ? encoded : raw;
-            const std::streampos position = output.tellp();
-            if (position < 0) {
-                error = "Could not determine payload offset: " + payloadPath;
-                return false;
-            }
-            if (!writeBytes(output, payload)) {
-                error = "Failed writing compressed payload: " + payloadPath;
-                return false;
-            }
-
-            CompressedChunkInfo info;
-            info.metadata = chunk;
-            info.payloadOffset = static_cast<uint64_t>(
-                static_cast<std::streamoff>(position));
-            info.storedSize = payload.size();
-            info.codec = useHuffman ? "huffman" : "raw";
-            result.payloadChunks.push_back(std::move(info));
-            payloadIndex[chunk.fingerprint].push_back({&file, &chunk});
-
-            result.metrics.uniqueInputBytes += chunk.length;
-            result.metrics.payloadBytes += payload.size();
-            if (useHuffman) {
-                ++result.metrics.huffmanChunks;
-            } else {
-                ++result.metrics.storedRawChunks;
-            }
-        }
-    }
-
-    output.close();
-    if (!output) {
-        error = "Failed closing compressed payload: " + payloadPath;
-        return false;
-    }
-    result.metrics.compressionBytesSaved =
-        result.metrics.uniqueInputBytes > result.metrics.payloadBytes
-            ? result.metrics.uniqueInputBytes - result.metrics.payloadBytes
-            : 0;
-    const uint64_t bundleBytes =
-        result.metrics.payloadBytes + result.metrics.bundleHeaderBytes;
-    result.metrics.totalBytesAvoided =
-        result.metrics.totalSourceBytes > bundleBytes
-            ? result.metrics.totalSourceBytes - bundleBytes
-            : 0;
+    rt_free_compression_result(&cResult);
     return true;
 }

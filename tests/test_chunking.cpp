@@ -1,5 +1,6 @@
 #include "scanner.h"
-#include "fingerprint.h"
+#include "fingerprint_c.h"
+#include "huffman_codec_c.h"
 #include "chunk_config.h"
 #include "chunk_metadata.h"
 #include "metrics.h"
@@ -7,11 +8,10 @@
 #include "cdc_chunker.h"
 #include "adaptive_policy.h"
 #include "chunk_engine.h"
-#include "huffman_codec.h"
 #include "compression_engine.h"
 
-#include <cassert>
-#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -20,6 +20,56 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+static std::string fingerprintHex(const uint8_t* data,
+                                  size_t size,
+                                  uint32_t seed = 42) {
+    char fingerprint[33];
+    rt_compute_fingerprint_hex(data, size, seed, fingerprint);
+    return fingerprint;
+}
+
+static bool huffmanCompress(const std::vector<uint8_t>& input,
+                            std::vector<uint8_t>& output,
+                            std::string& error) {
+    output.clear();
+    error.clear();
+    uint8_t* encoded = nullptr;
+    size_t encodedSize = 0;
+    char errorBuffer[512] = {};
+    if (!rt_huffman_compress(input.data(), input.size(), &encoded, &encodedSize,
+                             errorBuffer, sizeof(errorBuffer))) {
+        error = errorBuffer;
+        return false;
+    }
+    if (encodedSize != 0) {
+        output.assign(encoded, encoded + encodedSize);
+    }
+    std::free(encoded);
+    return true;
+}
+
+static bool huffmanDecompress(const std::vector<uint8_t>& input,
+                              uint64_t originalSize,
+                              std::vector<uint8_t>& output,
+                              std::string& error) {
+    output.clear();
+    error.clear();
+    uint8_t* decoded = nullptr;
+    size_t decodedSize = 0;
+    char errorBuffer[512] = {};
+    if (!rt_huffman_decompress(input.data(), input.size(), originalSize,
+                               &decoded, &decodedSize, errorBuffer,
+                               sizeof(errorBuffer))) {
+        error = errorBuffer;
+        return false;
+    }
+    if (decodedSize != 0) {
+        output.assign(decoded, decoded + decodedSize);
+    }
+    std::free(decoded);
+    return true;
+}
 
 // Lightweight test framework
 static int g_tests_run = 0;
@@ -197,8 +247,8 @@ static void test_binary_data_embedded_nulls() {
     std::vector<uint8_t> binData = {0x00, 0x11, 0x00, 0x00, 0x22, 0x00, 0x33, 0x00, 0x00, 0x44};
     std::vector<uint8_t> binData2 = {0x00, 0x11, 0x00, 0x00, 0x22, 0x00, 0x33, 0x00, 0x00, 0x55}; // differs at end
 
-    std::string fp1 = compute_fingerprint_hex(binData.data(), binData.size());
-    std::string fp2 = compute_fingerprint_hex(binData2.data(), binData2.size());
+    std::string fp1 = fingerprintHex(binData.data(), binData.size());
+    std::string fp2 = fingerprintHex(binData2.data(), binData2.size());
 
     TEST_ASSERT(!fp1.empty(), "Fingerprint 1 must not be empty");
     TEST_ASSERT(fp1.length() == 32, "Fingerprint must be 32 hex chars");
@@ -215,9 +265,28 @@ static void test_binary_data_embedded_nulls() {
 // CRC32 must match the standard IEEE 802.3 known-answer vector.
 static void test_crc32_standard_vector() {
     const std::string sample = "123456789";
-    const uint32_t crc = compute_crc32(
+    const uint32_t crc = rt_compute_crc32(
         reinterpret_cast<const uint8_t*>(sample.data()), sample.size());
     TEST_ASSERT(crc == 0xCBF43926U, "CRC32 known-answer vector mismatch");
+}
+
+static void test_c_murmurhash_hex_matches_binary_result() {
+    const std::vector<uint8_t> input = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x42
+    };
+    constexpr uint32_t seed = 12345;
+    const RtFingerprint128 cHash =
+        rt_murmurhash3_128(input.data(), input.size(), seed);
+
+    char cHex[33] = {};
+    rt_compute_fingerprint_hex(input.data(), input.size(), seed, cHex);
+    char expected[33];
+    std::snprintf(expected, sizeof(expected), "%016llx%016llx",
+                  static_cast<unsigned long long>(cHash.high),
+                  static_cast<unsigned long long>(cHash.low));
+    TEST_ASSERT(std::string(cHex) == expected,
+                "C MurmurHash3 hex does not match its binary result");
 }
 
 // 8. Identical files producing identical fingerprints
@@ -249,8 +318,8 @@ static void test_changed_contents_produce_different_fingerprints() {
     std::vector<uint8_t> data1 = {1, 2, 3, 4, 5, 6, 7, 8};
     std::vector<uint8_t> data2 = {1, 2, 3, 4, 5, 6, 7, 9}; // 1 bit diff
 
-    std::string fp1 = compute_fingerprint_hex(data1.data(), data1.size());
-    std::string fp2 = compute_fingerprint_hex(data2.data(), data2.size());
+    std::string fp1 = fingerprintHex(data1.data(), data1.size());
+    std::string fp2 = fingerprintHex(data2.data(), data2.size());
     TEST_ASSERT(fp1 != fp2, "Single bit change must yield completely different fingerprint");
 }
 
@@ -279,7 +348,7 @@ static void test_correct_offsets_and_lengths() {
         std::vector<uint8_t> payload;
         bool readOk = ChunkEngine::readChunkPayload(p.string(), chunks[i].offset, chunks[i].length, payload);
         TEST_ASSERT(readOk, "readChunkPayload failed");
-        std::string fpReread = compute_fingerprint_hex(payload.data(), payload.size());
+        std::string fpReread = fingerprintHex(payload.data(), payload.size());
         TEST_ASSERT(fpReread == chunks[i].fingerprint, "Reread chunk fingerprint does not match metadata");
     }
     TEST_ASSERT(totalLength == 5500, "Sum of chunk lengths must equal file size");
@@ -563,8 +632,8 @@ static void test_payload_reread_and_byte_comparison() {
     fs::path pA = createTestFile("verifA.bin", dataA);
     fs::path pB = createTestFile("verifB.bin", dataB);
 
-    std::string fpA = compute_fingerprint_hex(dataA.data(), dataA.size());
-    std::string fpB = compute_fingerprint_hex(dataB.data(), dataB.size());
+    std::string fpA = fingerprintHex(dataA.data(), dataA.size());
+    std::string fpB = fingerprintHex(dataB.data(), dataB.size());
     TEST_ASSERT(fpA == fpB, "Fingerprints match");
 
     // Candidate match verification: reread payloads and compare byte-for-byte
@@ -608,16 +677,16 @@ static void test_huffman_round_trip() {
     std::vector<uint8_t> encoded;
     std::vector<uint8_t> decoded;
     std::string error;
-    TEST_ASSERT(HuffmanCodec::compress(input, encoded, error),
+    TEST_ASSERT(huffmanCompress(input, encoded, error),
                 "Huffman compressor rejected valid binary data");
-    TEST_ASSERT(HuffmanCodec::decompress(encoded, input.size(), decoded, error),
+    TEST_ASSERT(huffmanDecompress(encoded, input.size(), decoded, error),
                 "Huffman decompressor rejected its own output");
     TEST_ASSERT(decoded == input, "Huffman round-trip changed input bytes");
 
     const std::vector<uint8_t> empty;
-    TEST_ASSERT(HuffmanCodec::compress(empty, encoded, error),
+    TEST_ASSERT(huffmanCompress(empty, encoded, error),
                 "Huffman compressor rejected empty input");
-    TEST_ASSERT(HuffmanCodec::decompress(encoded, 0, decoded, error) && decoded.empty(),
+    TEST_ASSERT(huffmanDecompress(encoded, 0, decoded, error) && decoded.empty(),
                 "Empty Huffman stream did not round-trip");
 }
 
@@ -684,8 +753,8 @@ static void test_selective_huffman_compression() {
 
         std::vector<uint8_t> decoded;
         if (chunk.codec == "huffman") {
-            TEST_ASSERT(HuffmanCodec::decompress(stored, chunk.metadata.length,
-                                                 decoded, error),
+            TEST_ASSERT(huffmanDecompress(stored, chunk.metadata.length,
+                                          decoded, error),
                         "Could not decode selected Huffman chunk");
         } else {
             TEST_ASSERT(chunk.codec == "raw", "Unknown selected chunk codec");
@@ -762,6 +831,7 @@ int main() {
     RUN_TEST(test_not_divisible_by_chunk_size);
     RUN_TEST(test_binary_data_embedded_nulls);
     RUN_TEST(test_crc32_standard_vector);
+    RUN_TEST(test_c_murmurhash_hex_matches_binary_result);
     RUN_TEST(test_identical_files_produce_identical_fingerprints);
     RUN_TEST(test_changed_contents_produce_different_fingerprints);
     RUN_TEST(test_correct_offsets_and_lengths);

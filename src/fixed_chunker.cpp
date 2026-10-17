@@ -1,5 +1,5 @@
 #include "fixed_chunker.h"
-#include "fingerprint.h"
+#include "fingerprint_c.h"
 
 #include <chrono>
 #include <fstream>
@@ -63,8 +63,10 @@ bool FixedChunker::chunkFile(const std::string& fullPath,
 
         // Fingerprint timing
         auto fpStart = std::chrono::steady_clock::now();
-        std::string fp = compute_fingerprint_hex(buffer.data(), chunkSizeActual);
-        uint32_t crc = compute_crc32(buffer.data(), chunkSizeActual);
+        char fingerprint[33];
+        rt_compute_fingerprint_hex(buffer.data(), chunkSizeActual, 42, fingerprint);
+        std::string fp(fingerprint);
+        uint32_t crc = rt_compute_crc32(buffer.data(), chunkSizeActual);
         auto fpEnd = std::chrono::steady_clock::now();
         totalFpDurationMs += std::chrono::duration<double, std::milli>(fpEnd - fpStart).count();
 
@@ -163,8 +165,10 @@ bool FixedChunker::chunkBuffer(const uint8_t* buffer,
         const uint8_t* chunkPtr = buffer + currentOffset;
 
         auto fpStart = std::chrono::steady_clock::now();
-        std::string fp = compute_fingerprint_hex(chunkPtr, bytesToTake);
-        uint32_t crc = compute_crc32(chunkPtr, bytesToTake);
+        char fingerprint[33];
+        rt_compute_fingerprint_hex(chunkPtr, bytesToTake, 42, fingerprint);
+        std::string fp(fingerprint);
+        uint32_t crc = rt_compute_crc32(chunkPtr, bytesToTake);
         auto fpEnd = std::chrono::steady_clock::now();
         totalFpDurationMs += std::chrono::duration<double, std::milli>(fpEnd - fpStart).count();
 

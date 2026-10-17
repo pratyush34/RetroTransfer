@@ -82,7 +82,7 @@ Each saved JSON file contains a directory tree. Every directory has `name`, `pat
 
 ## 1. Project Overview
 
-**RetroTransfer** reduces redundant data in evolving projects. It scans and chunks a current project, can compare its chunks with a locally available baseline project, and writes a bundle containing only missing chunks. Missing chunks are encoded with canonical Huffman coding when that makes them smaller; otherwise they are stored raw. Network transfer, persistent receiver storage, and project reconstruction are not implemented.
+**RetroTransfer** reduces redundant data in evolving projects. It scans and chunks a current project, can compare its chunks with a locally available baseline project, and writes a bundle containing only missing chunks. MurmurHash3, CRC32, canonical Huffman coding, and selective compression/deduplication are implemented in C. The C++ application calls the C hashing and Huffman APIs directly; a C++ facade remains for integration with the compression engine. Missing chunks are encoded with canonical Huffman coding when that makes them smaller; otherwise they are stored raw. Network transfer, persistent receiver storage, and project reconstruction are not implemented.
 
 ### System Pipeline Roadmap
 
@@ -100,6 +100,7 @@ flowchart LR
 > [!NOTE]
 > Stages currently implemented: **Project Scanner**, **Chunking Engine** (Fixed & CDC), **Chunk Fingerprinting** (MurmurHash3 128-bit & CRC32), **Workload-Aware Adaptive Chunking**, **local baseline comparison with byte verification**, **per-chunk Huffman compression with raw fallback**, and **a local payload bundle plus JSON manifest**.
 > Stages not implemented: persistent receiver chunk storage, TCP/local-network transfer, resumable transfer, receiver-side decompression, and project reconstruction.
+> MurmurHash3, CRC32, Huffman coding, and selective compression/deduplication are implemented in C. Chunking, scanning, CLI orchestration, and the application-facing compression facade remain in C++.
 
 ---
 
@@ -176,7 +177,7 @@ Raw bytes can be retrieved on demand at any time using:
 ## 5. Chunk Fingerprinting & Integrity Verification
 
 - **MurmurHash3_x64_128**:
-  - Implements Austin Appleby's reference algorithm for 128-bit non-cryptographic hashing.
+  - The C implementation follows the MurmurHash3_x64_128 algorithm for 128-bit non-cryptographic hashing.
   - Formatted as a deterministic 32-character lowercase hexadecimal string.
   - High-throughput non-cryptographic hashing. Actual throughput depends on hardware, compiler, and input size.
   - Handles arbitrary binary streams and embedded null bytes correctly.
