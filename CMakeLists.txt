@@ -19,6 +19,7 @@ set(RETRO_CORE_SOURCES
     src/huffman_codec.c
     src/compression_engine.c
     src/compression_engine.cpp
+    src/reconstruction_engine.cpp
     src/fixed_chunker.cpp
     src/cdc_chunker.cpp
     src/adaptive_policy.cpp

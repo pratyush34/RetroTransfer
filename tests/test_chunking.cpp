@@ -9,6 +9,7 @@
 #include "adaptive_policy.h"
 #include "chunk_engine.h"
 #include "compression_engine.h"
+#include "reconstruction_engine.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -816,6 +817,103 @@ static void test_selective_compression_deduplicates_current_chunks() {
                 "Total bytes avoided should account for bundle contents");
 }
 
+static void test_reconstruction_uses_payload_and_existing_chunks() {
+    setupTestDir();
+    fs::create_directories(TEST_DIR / "baseline");
+    fs::create_directories(TEST_DIR / "current");
+    fs::create_directories(TEST_DIR / "destination");
+
+    const std::vector<uint8_t> shared(4096, 'S');
+    const std::vector<uint8_t> added(4096, 'A');
+    const std::vector<uint8_t> unrelated(32, 'U');
+    createTestFile("baseline/shared.txt", shared);
+    createTestFile("current/shared.txt", shared);
+    createTestFile("current/added.txt", added);
+    createTestFile("destination/shared.txt", shared);
+    createTestFile("destination/keep.txt", unrelated);
+
+    EngineConfig config;
+    config.strategy = ChunkStrategy::Fixed;
+    config.fixedConfig.chunkSize = shared.size();
+    ChunkEngine engine(config);
+    ProjectScanner baselineScanner((TEST_DIR / "baseline").string());
+    ProjectScanner currentScanner((TEST_DIR / "current").string());
+    const ProjectChunkResult baseline = engine.processScannedProject(
+        baselineScanner.scan(), (TEST_DIR / "baseline").string());
+    const ProjectChunkResult current = engine.processScannedProject(
+        currentScanner.scan(), (TEST_DIR / "current").string());
+
+    const fs::path payloadPath = TEST_DIR / "bundle.rtpack";
+    CompressionResult compression;
+    std::string error;
+    CompressionEngine compressor;
+    TEST_ASSERT(compressor.compressMissingChunks(current, baseline,
+                                                 payloadPath.string(),
+                                                 compression, error),
+                "Could not create reconstruction test payload");
+
+    const fs::path manifestPath = TEST_DIR / "chunks.json";
+    std::ofstream manifest(manifestPath);
+    manifest << "{\n"
+             << "\"selectedStrategy\":\"fixed\",\n"
+             << "\"chunking\":{\"fixedChunkSize\":" << shared.size()
+             << ",\"cdcMinChunkSize\":16384,\"cdcTargetChunkSize\":65536,"
+                "\"cdcMaxChunkSize\":262144},\n"
+             << "\"selectiveCompression\":{\"payloadFile\":\"bundle.rtpack\","
+                "\"payloadChunks\":[";
+    for (size_t i = 0; i < compression.payloadChunks.size(); ++i) {
+        const CompressedChunkInfo& chunk = compression.payloadChunks[i];
+        if (i != 0) manifest << ",";
+        manifest << "{\"fingerprint\":\"" << chunk.metadata.fingerprint
+                 << "\",\"originalSize\":" << chunk.metadata.length
+                 << ",\"payloadOffset\":" << chunk.payloadOffset
+                 << ",\"storedSize\":" << chunk.storedSize
+                 << ",\"codec\":\"" << chunk.codec
+                 << "\",\"crc32\":" << chunk.metadata.crc32 << "}";
+    }
+    manifest << "]},\"files\":[";
+    for (size_t i = 0; i < current.files.size(); ++i) {
+        const FileChunkResult& file = current.files[i];
+        if (i != 0) manifest << ",";
+        manifest << "{\"path\":\"" << file.relativePath << "\",\"size\":"
+                 << file.metrics.fileSize << ",\"chunks\":[";
+        for (size_t c = 0; c < file.chunks.size(); ++c) {
+            const ChunkMetadata& chunk = file.chunks[c];
+            if (c != 0) manifest << ",";
+            manifest << "{\"seq\":" << chunk.sequenceNumber
+                     << ",\"offset\":" << chunk.offset
+                     << ",\"length\":" << chunk.length
+                     << ",\"fingerprint\":\"" << chunk.fingerprint
+                     << "\",\"crc32\":" << chunk.crc32 << "}";
+        }
+        manifest << "]}";
+    }
+    manifest << "]}\n";
+    manifest.close();
+    TEST_ASSERT(manifest.good(), "Could not write reconstruction test manifest");
+
+    ReconstructionEngine reconstruction;
+    ReconstructionResult result;
+    TEST_ASSERT(reconstruction.reconstruct(manifestPath.string(), payloadPath.string(),
+                                           (TEST_DIR / "destination").string(),
+                                           result, error),
+                "Reconstruction failed: " + error);
+    TEST_ASSERT(result.filesWritten == 2, "Expected two reconstructed files");
+    TEST_ASSERT(result.chunksReused == 1, "Expected shared chunk to be reused");
+    TEST_ASSERT(result.chunksWritten == 1, "Expected added chunk from payload");
+    const auto readFile = [](const fs::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::vector<uint8_t>(std::istreambuf_iterator<char>(input),
+                                    std::istreambuf_iterator<char>());
+    };
+    TEST_ASSERT(readFile(TEST_DIR / "destination/shared.txt") == shared,
+                "Existing shared file was not preserved");
+    TEST_ASSERT(readFile(TEST_DIR / "destination/added.txt") == added,
+                "Payload file was not reconstructed");
+    TEST_ASSERT(readFile(TEST_DIR / "destination/keep.txt") == unrelated,
+                "Unrelated destination file should remain untouched");
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << "   RETROTRANSFER CHUNKING ENGINE TESTS  \n";
@@ -850,6 +948,7 @@ int main() {
     RUN_TEST(test_huffman_round_trip);
     RUN_TEST(test_selective_huffman_compression);
     RUN_TEST(test_selective_compression_deduplicates_current_chunks);
+    RUN_TEST(test_reconstruction_uses_payload_and_existing_chunks);
 
     cleanupTestDir();
 

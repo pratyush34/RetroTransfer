@@ -6,6 +6,12 @@ Set-Location "C:\Users\Pratyush\Downloads\coding\RetroTransfer"
 .\build-ucrt64\RetroTransferSetupCLI.exe
 ```
 
+Choose **3. Reconstruct or update a project** in the interactive menu. Enter
+the chunk manifest path, optionally enter the `.rtpack` path (leave it blank
+when the bundle is beside the manifest and has the recorded filename), then
+enter the destination folder. Choose an empty folder for a full package, or the
+matching baseline project folder to apply an incremental update.
+
 ### Quick Build & Run (MinGW / UCRT64 + CMake)
 
 ```powershell
@@ -59,6 +65,40 @@ New-Item -ItemType Directory -Path $baseline | Out-Null
   --payload-output v2-missing.rtpack
 ```
 
+### Reconstruct or update a project from a package
+
+For a complete package, use `--compress-all` when creating it, then reconstruct
+into a new or empty destination:
+
+```powershell
+.\build-ucrt64\RetroTransfer.exe "C:\Projects\MyProject" `
+  --compress-all `
+  --scan-output project-scan.json `
+  --chunks-output project-chunks.json `
+  --payload-output project.rtpack
+
+.\build-ucrt64\RetroTransfer.exe --reconstruct collection\project-chunks.json `
+  --payload collection\project.rtpack `
+  --output "C:\Projects\MyProject-restored"
+```
+
+For an incremental update, create the package with `--baseline`. At the receiver,
+make sure the `--output` directory contains the matching baseline version.
+Reconstruction finds reusable chunks there, adds the missing chunk data, and
+overwrites files listed in the manifest. The same command updates an existing
+project folder in place:
+
+```powershell
+.\build-ucrt64\RetroTransfer.exe --reconstruct collection\v2-chunks.json `
+  --payload collection\v2-missing.rtpack `
+  --output "C:\Projects\MyProject-receiver"
+```
+
+The payload option is optional if the `.rtpack` is next to the manifest under the
+filename recorded in its metadata. Files not listed in the manifest are left
+unchanged; reconstruction does not delete files removed from the source project.
+It validates chunk fingerprints and CRC32 values before committing files.
+
 The scan is saved as JSON in the `collection` folder by default:
 ```powershell
 .\build-ucrt64\RetroTransfer.exe "any directory"
@@ -76,13 +116,15 @@ The legacy second positional argument still names the scan file. If an identical
 scan already exists under another JSON filename, the app reuses that existing
 file and avoids creating a duplicate. Existing files are never automatically deleted.
 
-Each saved JSON file contains a directory tree. Every directory has `name`, `path`,
+The scan JSON contains a directory tree. Every directory has `name`, `path`,
 `directories`, and `files` fields. Every file records its `name`, `path`, `size`,
-`type`, and `modificationTime`.
+`type`, and `modificationTime`. The chunk manifest contains the file reconstruction
+recipes, per-chunk fingerprints and CRC32 values, and (when packaged) payload
+offsets and codecs.
 
 ## 1. Project Overview
 
-**RetroTransfer** reduces redundant data in evolving projects. It scans and chunks a current project, can compare its chunks with a locally available baseline project, and writes a bundle containing only missing chunks. MurmurHash3, CRC32, canonical Huffman coding, and selective compression/deduplication are implemented in C. The C++ application calls the C hashing and Huffman APIs directly; a C++ facade remains for integration with the compression engine. Missing chunks are encoded with canonical Huffman coding when that makes them smaller; otherwise they are stored raw. Network transfer, persistent receiver storage, and project reconstruction are not implemented.
+**RetroTransfer** reduces redundant data in evolving projects. It scans and chunks a current project, can compare its chunks with a locally available baseline project, and writes a bundle containing only missing chunks. The receiver can reconstruct or update a project directory from the JSON recipe and RTPK payload, reusing verified chunks already present there. MurmurHash3, CRC32, canonical Huffman coding, and selective compression/deduplication are implemented in C. The C++ application calls the C hashing and Huffman APIs directly; a C++ facade remains for integration with the compression engine. Missing chunks are encoded with canonical Huffman coding when that makes them smaller; otherwise they are stored raw. Network transfer and persistent receiver storage are not implemented.
 
 ### System Pipeline Roadmap
 
@@ -94,12 +136,12 @@ flowchart LR
     D --> E["Selective Compression<br/>(Implemented - Huffman)"]
     E --> F["Payload Bundle + Manifest<br/>(Implemented)"]
     F --> G["TCP Socket Transfer<br/>(Planned - Winsock/POSIX)"]
-    G --> H["Reconstruction & Verification<br/>(Planned - CRC32)"]
+    F --> H["Reconstruction & Verification<br/>(Implemented - CRC32 + fingerprint)"]
 ```
 
 > [!NOTE]
 > Stages currently implemented: **Project Scanner**, **Chunking Engine** (Fixed & CDC), **Chunk Fingerprinting** (MurmurHash3 128-bit & CRC32), **Workload-Aware Adaptive Chunking**, **local baseline comparison with byte verification**, **per-chunk Huffman compression with raw fallback**, and **a local payload bundle plus JSON manifest**.
-> Stages not implemented: persistent receiver chunk storage, TCP/local-network transfer, resumable transfer, receiver-side decompression, and project reconstruction.
+> Stages not implemented: persistent receiver chunk storage, TCP/local-network transfer, and resumable transfer.
 > MurmurHash3, CRC32, Huffman coding, and selective compression/deduplication are implemented in C. Chunking, scanning, CLI orchestration, and the application-facing compression facade remain in C++.
 
 ---
@@ -325,7 +367,7 @@ adaptive    23        23          0.0%        9.73          11.29             3
 Output manifests:
 - `collection/scan.json`: Directory hierarchy (unchanged scanner output format)
 - `collection/scan_chunks.json`: Full chunk manifest, fingerprints, adaptive rationale, and metrics
-- `collection/scan_payload.rtpack`: Created only with `--baseline`; contains missing chunk bytes, Huffman-coded where smaller and raw otherwise
+- `collection/scan_payload.rtpack`: Created with `--baseline` or `--compress-all`; contains missing chunk bytes, Huffman-coded where smaller and raw otherwise
 
 ---
 
@@ -334,10 +376,10 @@ Output manifests:
 ### Current Limitations:
 - The adaptive policy currently uses file extension and size heuristics; it does not yet profile runtime Shannon entropy per block.
 - Baseline chunks are rescanned for each run; there is no persistent receiver chunk index.
-- The bundle and manifest are local artifacts only. Network transfer, resume, receiver-side decompression, and reconstruction are not implemented.
+- The bundle and manifest are local artifacts only. Network transfer, resume, and persistent receiver chunk storage are not implemented.
 - Compression is per chunk and currently uses canonical Huffman coding with raw fallback. RLE/LZW and a measured algorithm selector are not implemented.
 
 ### Recommended Next Steps for Deduplication Stage:
 1. **Persistent receiver index**: Store receiver chunk fingerprints and locations between runs instead of rescanning the baseline folder.
 2. **Transfer protocol**: Send the manifest and RTPK payload over local Wi-Fi/LAN, with acknowledgement and resume support.
-3. **Receiver decode and reconstruction**: Validate chunk CRCs, decode Huffman-coded chunks, and reconstruct the project tree from a recipe.
+3. **Transfer protocol**: Deliver the manifest and RTPK payload to the receiver with acknowledgement and resume support.

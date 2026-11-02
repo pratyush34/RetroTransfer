@@ -2,6 +2,7 @@
 #include "chunk_engine.h"
 #include "chunk_config.h"
 #include "compression_engine.h"
+#include "reconstruction_engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -222,6 +223,12 @@ static void writeChunkManifestJson(std::ofstream& out,
     out << "{\n";
     out << "  \"rootPath\": \"" << jsonEscape(rootPath) << "\",\n";
     out << "  \"selectedStrategy\": \"" << strategy_to_string(config.strategy) << "\",\n";
+    out << "  \"chunking\": {\n";
+    out << "    \"fixedChunkSize\": " << config.fixedConfig.chunkSize << ",\n";
+    out << "    \"cdcMinChunkSize\": " << config.cdcConfig.minChunkSize << ",\n";
+    out << "    \"cdcTargetChunkSize\": " << config.cdcConfig.targetChunkSize << ",\n";
+    out << "    \"cdcMaxChunkSize\": " << config.cdcConfig.maxChunkSize << "\n";
+    out << "  },\n";
     out << "  \"summary\": {\n";
     out << "    \"totalFiles\": " << result.metrics.totalFilesProcessed << ",\n";
     out << "    \"totalBytes\": " << result.metrics.totalBytesProcessed << ",\n";
@@ -325,6 +332,7 @@ static void printUsage(const char* progName) {
     std::cout << "RetroTransfer - Project Scanner and Adaptive Chunking Engine\n";
     std::cout << "Usage:\n";
     std::cout << "  " << progName << " [directory] [scan.json] [options]\n\n";
+    std::cout << "  " << progName << " --reconstruct <chunks.json> --output <directory> [--payload <file.rtpack>]\n\n";
     std::cout << "Arguments:\n";
     std::cout << "  [directory]           Root directory to scan (default: \".\")\n";
     std::cout << "  [scan.json]           Legacy positional scan filename inside collection/\n\n";
@@ -334,6 +342,9 @@ static void printUsage(const char* progName) {
     std::cout << "  --baseline <directory> Compare against a local receiver/project copy\n";
     std::cout << "  --compress-all        Package all unique chunks without a baseline\n";
     std::cout << "  --payload-output <name> Compressed bundle (requires --baseline or --compress-all)\n";
+    std::cout << "  --reconstruct <manifest> Rebuild files from a chunk manifest and payload\n";
+    std::cout << "  --payload <file.rtpack> Payload override (otherwise loaded beside manifest)\n";
+    std::cout << "  --output <directory>  Reconstruction destination; existing files are updated in place\n";
     std::cout << "  --strategy, -s <mode> Chunking strategy: \"adaptive\" (default), \"fixed\", or \"cdc\"\n";
     std::cout << "  --chunk-size <bytes>  Fixed chunk size in bytes (default: 65536)\n";
     std::cout << "  --min-chunk <bytes>   CDC minimum chunk size (default: 16384)\n";
@@ -412,6 +423,50 @@ static void runBenchmark(const DirectoryNode& directoryTree,
 }
 
 int main(int argc, char* argv[]) {
+    if (argc > 1 && std::string(argv[1]) == "--reconstruct") {
+        if (argc < 3 || std::string(argv[2]).rfind("--", 0) == 0) {
+            std::cerr << "Error: --reconstruct requires a chunk manifest path.\n";
+            return 2;
+        }
+        const std::string manifestPath = argv[2];
+        std::string payloadPath;
+        std::string outputPath;
+        for (int i = 3; i < argc; ++i) {
+            const std::string argument = argv[i];
+            if ((argument == "--payload" || argument == "--output") &&
+                i + 1 >= argc) {
+                std::cerr << "Error: " << argument << " requires a value.\n";
+                return 2;
+            }
+            if (argument == "--payload") {
+                payloadPath = argv[++i];
+            } else if (argument == "--output") {
+                outputPath = argv[++i];
+            } else {
+                std::cerr << "Error: Unrecognized reconstruction option: "
+                          << argument << "\n";
+                return 2;
+            }
+        }
+        if (outputPath.empty()) {
+            std::cerr << "Error: --reconstruct requires --output <directory>.\n";
+            return 2;
+        }
+        ReconstructionEngine reconstruction;
+        ReconstructionResult result;
+        std::string error;
+        if (!reconstruction.reconstruct(manifestPath, payloadPath, outputPath,
+                                        result, error)) {
+            std::cerr << "Error: Reconstruction failed: " << error << "\n";
+            return 1;
+        }
+        std::cout << "Reconstructed files: " << result.filesWritten << "\n";
+        std::cout << "Chunks from payload: " << result.chunksWritten << "\n";
+        std::cout << "Chunks reused      : " << result.chunksReused << "\n";
+        std::cout << "Output directory   : " << fs::absolute(outputPath) << "\n";
+        return 0;
+    }
+
     std::string path = ".";
     std::string scanOutputName = "scan.json";
     std::string chunksOutputName;

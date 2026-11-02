@@ -196,7 +196,8 @@ static void showMenu() {
                  "============================================\n"
                  "  1. Scan and chunk a project\n"
                  "  2. Scan, chunk, and selectively compress\n"
-                 "  3. Exit\n"
+                 "  3. Reconstruct or update a project\n"
+                 "  4. Exit\n"
                  "============================================\n"
                  "  Choose an option: ";
 }
@@ -268,6 +269,44 @@ static bool runSelectiveCompression() {
     return success;
 }
 
+static bool runReconstruction() {
+    std::string manifestPath;
+    std::string payloadPath;
+    std::string outputPath;
+    if (!readLine("Chunk manifest path: ", manifestPath) ||
+        !readLine("Payload path (blank to use the manifest's payload filename): ",
+                  payloadPath) ||
+        !readLine("Destination project folder: ", outputPath)) {
+        return false;
+    }
+
+    manifestPath = unquotePath(std::move(manifestPath));
+    payloadPath = unquotePath(std::move(payloadPath));
+    outputPath = unquotePath(std::move(outputPath));
+    if (manifestPath.empty()) {
+        std::cout << "Manifest path is required.\n";
+        return false;
+    }
+    if (outputPath.empty()) {
+        std::cout << "Destination folder is required.\n";
+        return false;
+    }
+
+    std::vector<std::string> arguments{"--reconstruct", manifestPath};
+    if (!payloadPath.empty()) {
+        arguments.push_back("--payload");
+        arguments.push_back(payloadPath);
+    }
+    arguments.push_back("--output");
+    arguments.push_back(outputPath);
+
+    std::cout << "\nStarting reconstruction into " << outputPath << ".\n\n";
+    const bool success = runRetroTransfer(arguments);
+    std::cout << (success ? "Reconstruction completed.\n"
+                          : "Reconstruction did not complete successfully.\n");
+    return success;
+}
+
 int main() {
     std::string input;
     while (true) {
@@ -282,10 +321,12 @@ int main() {
         } else if (input == "2") {
             runSelectiveCompression();
         } else if (input == "3") {
+            runReconstruction();
+        } else if (input == "4") {
             std::cout << "Exiting RetroTransfer.\n";
             return 0;
         } else {
-            std::cout << "Invalid choice. Enter 1, 2, or 3.\n";
+            std::cout << "Invalid choice. Enter 1, 2, 3, or 4.\n";
         }
     }
 }
