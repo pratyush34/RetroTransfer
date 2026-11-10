@@ -45,6 +45,7 @@ private:
                              uint64_t fileSize,
                              MessageType messageType,
                              const std::string& displayLabel,
+                             bool verbose,
                              std::string& error);
 
     /*

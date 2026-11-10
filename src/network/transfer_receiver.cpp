@@ -77,15 +77,62 @@ bool TransferReceiver::validateReceivedJson(const std::string& path, std::string
     return true;
 }
 
+void TransferReceiver::printProgress(const std::string& label,
+                                     const std::string& filename,
+                                     uint64_t bytesTransferred,
+                                     uint64_t totalBytes,
+                                     const std::chrono::steady_clock::time_point& startTime) {
+    auto now = std::chrono::steady_clock::now();
+    double elapsedSec = std::chrono::duration<double>(now - startTime).count();
+    double speedMBps = (elapsedSec > 0.001)
+        ? ((bytesTransferred / (1024.0 * 1024.0)) / elapsedSec)
+        : 0.0;
+
+    double percent = (totalBytes > 0)
+        ? (static_cast<double>(bytesTransferred) / static_cast<double>(totalBytes)) * 100.0
+        : 100.0;
+    percent = std::min(100.0, std::max(0.0, percent));
+
+    int barWidth = 24;
+    int filled = static_cast<int>(barWidth * (percent / 100.0));
+    filled = std::min(barWidth, std::max(0, filled));
+
+    std::cout << "\r[Receiver] " << label << " " << filename << " [" 
+              << std::string(filled, '=')
+              << std::string(barWidth - filled, ' ') << "] "
+              << std::fixed << std::setprecision(1) << percent << "% ("
+              << (bytesTransferred / 1024) << " KB / " << (totalBytes / 1024) << " KB) "
+              << std::setprecision(2) << speedMBps << " MB/s" << std::flush;
+
+    if (bytesTransferred >= totalBytes) {
+        std::cout << "\n";
+    }
+}
+
 bool TransferReceiver::receiveStreamedFile(socket_t sock,
                                            const std::string& tempPath,
                                            const std::string& finalPath,
                                            uint64_t expectedSize,
                                            const std::string& displayLabel,
+                                           bool verbose,
                                            std::string& error) {
     // Delete stale temp file if it exists
     std::error_code ec;
     fs::remove(tempPath, ec);
+
+    std::string filename = fs::path(finalPath).filename().string();
+    auto startTime = std::chrono::steady_clock::now();
+
+    if (expectedSize == 0) {
+        std::ofstream outFile(tempPath, std::ios::binary);
+        outFile.close();
+        fs::remove(finalPath, ec);
+        fs::rename(tempPath, finalPath, ec);
+        if (verbose) {
+            printProgress(displayLabel, filename, 0, 0, startTime);
+        }
+        return true;
+    }
 
     std::ofstream outFile(tempPath, std::ios::binary);
     if (!outFile) {
@@ -117,6 +164,9 @@ bool TransferReceiver::receiveStreamedFile(socket_t sock,
         }
 
         bytesReceived += toRead;
+        if (verbose) {
+            printProgress(displayLabel, filename, bytesReceived, expectedSize, startTime);
+        }
     }
 
     outFile.close();
@@ -218,6 +268,20 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
         return false;
     }
 
+    // Verify sufficient disk space for incoming transfer
+    std::error_code spaceEc;
+    fs::space_info spaceInfo = fs::space(transferDir, spaceEc);
+    if (!spaceEc) {
+        uint64_t requiredBytes = tInfo.manifestSize + tInfo.payloadSize + (1024ULL * 1024ULL); // with 1MB margin
+        if (spaceInfo.available < requiredBytes) {
+            error = "Insufficient disk space: " + std::to_string(spaceInfo.available) +
+                    " bytes available, " + std::to_string(requiredBytes) + " bytes required";
+            sendErrorMessage(clientSock, error);
+            closeSocket(clientSock);
+            return false;
+        }
+    }
+
     if (config.verbose) {
         std::cout << "[Receiver] Transfer ID : " << tInfo.transferId << "\n";
         std::cout << "[Receiver] Destination : " << transferDir.string() << "\n";
@@ -256,7 +320,7 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
 
     if (config.verbose) std::cout << "[Receiver] Receiving manifest...\n";
     if (!receiveStreamedFile(clientSock, tempManifestPath.string(), finalManifestPath.string(),
-                             tInfo.manifestSize, "manifest", error)) {
+                             tInfo.manifestSize, "manifest", config.verbose, error)) {
         sendErrorMessage(clientSock, error);
         closeSocket(clientSock);
         return false;
@@ -301,7 +365,7 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
 
     if (config.verbose) std::cout << "[Receiver] Receiving payload bundle...\n";
     if (!receiveStreamedFile(clientSock, tempPayloadPath.string(), finalPayloadPath.string(),
-                             tInfo.payloadSize, "payload", error)) {
+                             tInfo.payloadSize, "payload", config.verbose, error)) {
         sendErrorMessage(clientSock, error);
         closeSocket(clientSock);
         return false;

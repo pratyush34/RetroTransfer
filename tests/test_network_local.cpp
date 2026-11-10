@@ -130,13 +130,126 @@ static void test_disconnect_detection() {
     server.stop();
 }
 
+static void test_sequential_connections() {
+    TcpServer server;
+    TEST_ASSERT(server.start(0, "127.0.0.1"), "Server started on ephemeral port for sequential test");
+    uint16_t port = server.getPort();
+
+    std::thread serverThread([&]() {
+        // Handle Client 1
+        std::string ip1;
+        uint16_t port1 = 0;
+        socket_t s1 = server.acceptClient(ip1, port1, 5000);
+        TEST_ASSERT(s1 != INVALID_SOCKET_FD, "Server accepted sequential client 1");
+        PacketHeader h1;
+        std::vector<uint8_t> p1;
+        std::string err;
+        TEST_ASSERT(receiveFramedMessage(s1, h1, p1, err), "Server received msg from client 1");
+        TEST_ASSERT(sendFramedMessage(s1, MessageType::HELLO_ACK, {}), "Server acked client 1");
+        closeSocket(s1);
+
+        // Handle Client 2
+        std::string ip2;
+        uint16_t port2 = 0;
+        socket_t s2 = server.acceptClient(ip2, port2, 5000);
+        TEST_ASSERT(s2 != INVALID_SOCKET_FD, "Server accepted sequential client 2");
+        PacketHeader h2;
+        std::vector<uint8_t> p2;
+        TEST_ASSERT(receiveFramedMessage(s2, h2, p2, err), "Server received msg from client 2");
+        TEST_ASSERT(sendFramedMessage(s2, MessageType::HELLO_ACK, {}), "Server acked client 2");
+        closeSocket(s2);
+    });
+
+    // Client 1
+    {
+        TcpClient client1;
+        TEST_ASSERT(client1.connect("127.0.0.1", port, 2000), "Client 1 connected");
+        TEST_ASSERT(sendFramedMessage(client1.getSocket(), MessageType::HELLO, {}), "Client 1 sent HELLO");
+        PacketHeader ack;
+        std::vector<uint8_t> p;
+        std::string err;
+        TEST_ASSERT(receiveFramedMessage(client1.getSocket(), ack, p, err), "Client 1 received ack");
+        client1.disconnect();
+        TEST_ASSERT(!client1.isConnected(), "Client 1 disconnected cleanly");
+    }
+
+    // Client 2
+    {
+        TcpClient client2;
+        TEST_ASSERT(client2.connect("127.0.0.1", port, 2000), "Client 2 connected");
+        TEST_ASSERT(sendFramedMessage(client2.getSocket(), MessageType::HELLO, {}), "Client 2 sent HELLO");
+        PacketHeader ack;
+        std::vector<uint8_t> p;
+        std::string err;
+        TEST_ASSERT(receiveFramedMessage(client2.getSocket(), ack, p, err), "Client 2 received ack");
+        client2.disconnect();
+        TEST_ASSERT(!client2.isConnected(), "Client 2 disconnected cleanly");
+    }
+
+    serverThread.join();
+    server.stop();
+    TEST_ASSERT(!server.isListening(), "Server stopped after sequential test");
+}
+
+static void test_client_wrong_ip() {
+    TcpClient client;
+    bool ok = client.connect("invalid.nonexistent.domain.test", 8080, 500);
+    TEST_ASSERT(!ok, "Connecting to non-existent domain fails cleanly");
+    TEST_ASSERT(!client.getLastError().empty(), "Meaningful error message recorded for non-existent domain");
+}
+
+static void test_client_timeout() {
+    TcpClient client;
+    auto t0 = std::chrono::steady_clock::now();
+    // Non-routable TEST-NET-1 IP address (RFC 5737)
+    bool ok = client.connect("192.0.2.1", 8080, 500);
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    TEST_ASSERT(!ok, "Connecting to unreachable host timed out / failed cleanly");
+    TEST_ASSERT(ms >= 400 && ms < 4000, "Connection timeout respected configured duration (< 4s)");
+    TEST_ASSERT(!client.getLastError().empty(), "Error message recorded on timeout");
+}
+
+static void test_server_binding_and_cleanup() {
+    TcpServer server;
+    TEST_ASSERT(!server.isListening(), "Initially not listening");
+    TEST_ASSERT(server.getPort() == 0, "Initial port is 0");
+
+    TEST_ASSERT(server.start(0, "127.0.0.1"), "Server started");
+    TEST_ASSERT(server.isListening(), "Server is listening");
+    uint16_t assignedPort = server.getPort();
+    TEST_ASSERT(assignedPort > 0, "Assigned valid ephemeral port");
+
+    server.stop();
+    TEST_ASSERT(!server.isListening(), "Server stopped");
+    TEST_ASSERT(server.getPort() == 0, "Port reset to 0 after stop");
+
+    // Restart server on another port
+    TEST_ASSERT(server.start(0, "127.0.0.1"), "Server restarted on new ephemeral port");
+    TEST_ASSERT(server.isListening(), "Server is listening after restart");
+    server.stop();
+}
+
+static void test_networking_init_cleanup() {
+    TEST_ASSERT(initializeNetworking(), "initializeNetworking succeeds");
+    cleanupNetworking();
+    // Re-initialize to verify idempotency
+    TEST_ASSERT(initializeNetworking(), "Re-initialize networking succeeds");
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << "        RUNNING LOCAL NETWORK TESTS     \n";
     std::cout << "========================================\n";
 
+    test_networking_init_cleanup();
+    test_server_binding_and_cleanup();
     test_handshake_and_info();
+    test_sequential_connections();
     test_connection_failure();
+    test_client_wrong_ip();
+    test_client_timeout();
     test_disconnect_detection();
 
     std::cout << "========================================\n";

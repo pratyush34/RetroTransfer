@@ -120,6 +120,83 @@ static void test_circular_wrap_around(void) {
     transfer_queue_destroy(&q);
 }
 
+static void test_repeated_operations_10000(void) {
+    TransferQueue q;
+    const size_t cap = 16; /* Same capacity used by TransferSender */
+    TEST_ASSERT(transfer_queue_init(&q, cap) == 1, "Queue init with capacity 16");
+
+    const uint32_t total_ops = 20000;
+    uint32_t enqueued_count = 0;
+    uint32_t dequeued_count = 0;
+    int ordering_ok = 1;
+
+    /* Execute 20,000 operations with dynamic batch sizes */
+    while (dequeued_count < total_ops) {
+        /* Enqueue a batch up to capacity */
+        uint32_t batch = (rand() % cap) + 1;
+        for (uint32_t i = 0; i < batch && enqueued_count < total_ops; i++) {
+            if (transfer_queue_is_full(&q)) {
+                break;
+            }
+            TransferBlockDesc in;
+            in.file_offset = (uint64_t)enqueued_count * 65536;
+            in.block_size = 65536;
+            in.block_index = enqueued_count;
+            in.is_last = (enqueued_count == total_ops - 1) ? 1 : 0;
+
+            if (!transfer_queue_enqueue(&q, &in)) {
+                ordering_ok = 0;
+                break;
+            }
+            enqueued_count++;
+        }
+
+        /* Dequeue elements and verify FIFO ordering and data integrity */
+        uint32_t drain = (rand() % (transfer_queue_size(&q) + 1));
+        if (drain == 0 && !transfer_queue_is_empty(&q)) {
+            drain = 1;
+        }
+        for (uint32_t i = 0; i < drain; i++) {
+            TransferBlockDesc out;
+            if (!transfer_queue_dequeue(&q, &out)) {
+                break;
+            }
+            if (out.block_index != dequeued_count ||
+                out.file_offset != (uint64_t)dequeued_count * 65536 ||
+                out.block_size != 65536 ||
+                out.is_last != ((dequeued_count == total_ops - 1) ? 1 : 0)) {
+                ordering_ok = 0;
+            }
+            dequeued_count++;
+        }
+    }
+
+    /* Drain any remaining items */
+    while (!transfer_queue_is_empty(&q)) {
+        TransferBlockDesc out;
+        if (transfer_queue_dequeue(&q, &out)) {
+            if (out.block_index != dequeued_count) {
+                ordering_ok = 0;
+            }
+            dequeued_count++;
+        }
+    }
+
+    TEST_ASSERT(ordering_ok == 1, "20,000 operations preserved strict FIFO order & integrity");
+    TEST_ASSERT(dequeued_count == total_ops, "Dequeued count reached total operations (20,000)");
+    TEST_ASSERT(transfer_queue_is_empty(&q) == 1, "Queue is empty after 20,000 operations");
+
+    /* Clear and test reuse */
+    transfer_queue_clear(&q);
+    TEST_ASSERT(transfer_queue_size(&q) == 0, "Queue cleared");
+    TransferBlockDesc d = {0, 512, 1, 1};
+    TEST_ASSERT(transfer_queue_enqueue(&q, &d) == 1, "Enqueue after clear");
+    TEST_ASSERT(transfer_queue_size(&q) == 1, "Size is 1 after clear + enqueue");
+
+    transfer_queue_destroy(&q);
+    TEST_ASSERT(transfer_queue_is_empty(&q) == 1, "Queue destroyed successfully");
+}
+
 int main(void) {
     printf("========================================\n");
     printf("     RUNNING C TRANSFER QUEUE TESTS     \n");
@@ -129,6 +206,7 @@ int main(void) {
     test_enqueue_dequeue_fifo();
     test_overflow_and_underflow();
     test_circular_wrap_around();
+    test_repeated_operations_10000();
 
     printf("========================================\n");
     printf("Results: %d run, %d failed\n", g_tests_run, g_tests_failed);

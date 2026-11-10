@@ -4,7 +4,7 @@
 #include <string.h>
 
 int transfer_queue_init(TransferQueue* q, size_t capacity) {
-    if (!q || capacity == 0) {
+    if (!q || capacity == 0 || capacity > ((size_t)-1) / sizeof(TransferBlockDesc)) {
         return 0;
     }
 

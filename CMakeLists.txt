@@ -30,6 +30,7 @@ set(RETRO_CORE_SOURCES
     src/cdc_chunker.cpp
     src/adaptive_policy.cpp
     src/chunk_engine.cpp
+    src/manifest_writer.cpp
 )
 
 set(RETRO_NETWORK_SOURCES

@@ -5,6 +5,7 @@
 #include "network/protocol.h"
 #include "reconstruction_engine.h"
 
+#include <chrono>
 #include <string>
 
 namespace retro::net {
@@ -63,7 +64,17 @@ private:
                              const std::string& finalPath,
                              uint64_t expectedSize,
                              const std::string& displayLabel,
+                             bool verbose,
                              std::string& error);
+
+    /*
+     * Display progress bar and transfer speed on receiver.
+     */
+    void printProgress(const std::string& label,
+                       const std::string& filename,
+                       uint64_t bytesTransferred,
+                       uint64_t totalBytes,
+                       const std::chrono::steady_clock::time_point& startTime);
 
     /*
      * Validate JSON format of the received manifest file.

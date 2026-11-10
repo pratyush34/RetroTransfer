@@ -4,6 +4,7 @@
 #include "chunk_engine.h"
 #include "compression_engine.h"
 #include "reconstruction_engine.h"
+#include "manifest_writer.h"
 
 #include <cassert>
 #include <filesystem>
@@ -159,6 +160,34 @@ static void test_binary_with_null_bytes() {
     fs::remove_all(tempDir, ec);
 }
 
+static void test_binary_all_byte_values() {
+    fs::path tempDir = fs::current_path() / "build" / "test_tmp" / "binary_all_bytes";
+    std::error_code ec;
+    fs::remove_all(tempDir, ec);
+    fs::create_directories(tempDir, ec);
+
+    fs::path srcManifest = tempDir / "test_chunks.json";
+    fs::path srcPayload = tempDir / "payload.rtpack";
+
+    {
+        std::ofstream mf(srcManifest);
+        mf << "{\n  \"all_bytes\": true\n}\n";
+    }
+
+    // Binary payload containing all 256 byte values (0x00 - 0xFF) cycled repeatedly across 256 KiB
+    {
+        std::ofstream pf(srcPayload, std::ios::binary);
+        std::vector<uint8_t> data(256 * 1024);
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<uint8_t>(i % 256);
+        }
+        pf.write(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+
+    test_file_sizes_transfer(256 * 1024, "binary_all_bytes");
+    fs::remove_all(tempDir, ec);
+}
+
 static void test_end_to_end_pipeline_and_reconstruction() {
     std::cout << "\n--- Starting Mandatory End-to-End Pipeline & Reconstruction Test ---\n";
     fs::path rootTestDir = fs::current_path() / "build" / "test_tmp" / "e2e_project";
@@ -169,25 +198,36 @@ static void test_end_to_end_pipeline_and_reconstruction() {
     fs::create_directories(originalProjectDir / "src" / "sub", ec);
     fs::create_directories(originalProjectDir / "data", ec);
 
-    // Create diverse project files (text, code, binary)
+    // Create diverse project files (three source files, text, binary, nested directories)
     {
+        // Source file 1
         std::ofstream f1(originalProjectDir / "src" / "main.cpp");
-        f1 << "#include <iostream>\nint main() { std::cout << \"Hello RetroTransfer!\"; return 0; }\n";
+        f1 << "#include <iostream>\n#include \"sub/helper.h\"\nint main() { std::cout << \"Hello RetroTransfer! \" << helperFunction0(); return 0; }\n";
 
+        // Source file 2 (header in nested directory)
         std::ofstream f2(originalProjectDir / "src" / "sub" / "helper.h");
         for (int i = 0; i < 500; ++i) {
             f2 << "// Helper header line " << i << "\nint helperFunction" << i << "();\n";
         }
 
-        std::ofstream f3(originalProjectDir / "data" / "binary.bin", std::ios::binary);
+        // Source file 3 (source file in nested directory)
+        std::ofstream f3(originalProjectDir / "src" / "sub" / "helper.cpp");
+        f3 << "#include \"helper.h\"\nint helperFunction0() { return 42; }\n";
+        for (int i = 1; i < 500; ++i) {
+            f3 << "int helperFunction" << i << "() { return " << (i * 2) << "; }\n";
+        }
+
+        // Binary file (75 KiB of binary data)
+        std::ofstream f4(originalProjectDir / "data" / "binary.bin", std::ios::binary);
         std::vector<uint8_t> bin(75 * 1024);
         for (size_t i = 0; i < bin.size(); ++i) {
             bin[i] = static_cast<uint8_t>((i * 17 + 5) & 0xFF);
         }
-        f3.write(reinterpret_cast<const char*>(bin.data()), bin.size());
+        f4.write(reinterpret_cast<const char*>(bin.data()), bin.size());
 
-        std::ofstream f4(originalProjectDir / "README.txt");
-        f4 << "Sample Project for RetroTransfer End-to-End Verification\nTesting full reconstruction.\n";
+        // Text file
+        std::ofstream f5(originalProjectDir / "README.txt");
+        f5 << "Sample Project for RetroTransfer End-to-End Verification\nTesting full reconstruction.\n";
     }
 
     // 1. Scan directory with existing ProjectScanner
@@ -200,7 +240,7 @@ static void test_end_to_end_pipeline_and_reconstruction() {
     engineCfg.strategy = ChunkStrategy::Adaptive;
     ChunkEngine chunkEngine(engineCfg);
     ProjectChunkResult chunkResult = chunkEngine.processScannedProject(tree, originalProjectDir.string());
-    TEST_ASSERT(chunkResult.metrics.totalFilesProcessed == 4, "Chunk engine processed 4 files");
+    TEST_ASSERT(chunkResult.metrics.totalFilesProcessed == 5, "Chunk engine processed 5 files (3 code, 1 text, 1 bin)");
     TEST_ASSERT(chunkResult.metrics.totalChunksGenerated > 0, "Chunk engine produced chunks");
 
     // 3. Generate .rtpack with existing CompressionEngine
@@ -221,45 +261,14 @@ static void test_end_to_end_pipeline_and_reconstruction() {
     TEST_ASSERT(compOk, "Compression engine generated .rtpack payload");
     TEST_ASSERT(fs::exists(payloadPath), "Payload file exists on disk");
 
-    // 4. Generate manifest JSON
+    // 4. Generate manifest JSON using the canonical RetroTransfer ManifestWriter
     {
         std::ofstream manifestOut(manifestPath);
-        manifestOut << "{\n"
-                    << "\"selectedStrategy\":\"adaptive\",\n"
-                    << "\"chunking\":{\"fixedChunkSize\":65536,\"cdcMinChunkSize\":16384,\"cdcTargetChunkSize\":65536,\"cdcMaxChunkSize\":262144},\n"
-                    << "\"selectiveCompression\":{\"payloadFile\":\"" << payloadPath.filename().string() << "\",\"payloadChunks\":[";
-        for (size_t i = 0; i < compResult.payloadChunks.size(); ++i) {
-            const CompressedChunkInfo& chunk = compResult.payloadChunks[i];
-            if (i != 0) manifestOut << ",";
-            manifestOut << "{\"fingerprint\":\"" << chunk.metadata.fingerprint
-                        << "\",\"originalSize\":" << chunk.metadata.length
-                        << ",\"payloadOffset\":" << chunk.payloadOffset
-                        << ",\"storedSize\":" << chunk.storedSize
-                        << ",\"codec\":\"" << chunk.codec
-                        << "\",\"crc32\":" << chunk.metadata.crc32 << "}";
-        }
-        manifestOut << "]},\"files\":[";
-        for (size_t i = 0; i < chunkResult.files.size(); ++i) {
-            const FileChunkResult& file = chunkResult.files[i];
-            std::string cleanRelPath = file.relativePath;
-            for (char& c : cleanRelPath) { if (c == '\\') c = '/'; }
-            if (i != 0) manifestOut << ",";
-            manifestOut << "{\"path\":\"" << cleanRelPath << "\",\"size\":"
-                        << file.metrics.fileSize << ",\"chunks\":[";
-            for (size_t c = 0; c < file.chunks.size(); ++c) {
-                const ChunkMetadata& chunk = file.chunks[c];
-                if (c != 0) manifestOut << ",";
-                manifestOut << "{\"seq\":" << chunk.sequenceNumber
-                            << ",\"offset\":" << chunk.offset
-                            << ",\"length\":" << chunk.length
-                            << ",\"fingerprint\":\"" << chunk.fingerprint
-                            << "\",\"crc32\":" << chunk.crc32 << "}";
-            }
-            manifestOut << "]}";
-        }
-        manifestOut << "]}\n";
+        retro::writeChunkManifestJson(manifestOut, chunkResult, engineCfg,
+                                      originalProjectDir.string(), "",
+                                      payloadPath.filename().string(), &compResult);
     }
-    TEST_ASSERT(fs::exists(manifestPath), "Manifest JSON file created");
+    TEST_ASSERT(fs::exists(manifestPath), "Manifest JSON file created via canonical ManifestWriter");
 
     // 5. Transfer over TCP to Receiver
     fs::path receivedDir = rootTestDir / "received";
@@ -322,6 +331,10 @@ static void test_end_to_end_pipeline_and_reconstruction() {
     TEST_ASSERT(filesEqual(originalProjectDir / "src" / "sub" / "helper.h",
                            reconstructedDir / "src" / "sub" / "helper.h"), "src/sub/helper.h matches byte-for-byte");
 
+    TEST_ASSERT(fs::exists(reconstructedDir / "src" / "sub" / "helper.cpp"), "Reconstructed src/sub/helper.cpp exists");
+    TEST_ASSERT(filesEqual(originalProjectDir / "src" / "sub" / "helper.cpp",
+                           reconstructedDir / "src" / "sub" / "helper.cpp"), "src/sub/helper.cpp matches byte-for-byte");
+
     TEST_ASSERT(fs::exists(reconstructedDir / "data" / "binary.bin"), "Reconstructed data/binary.bin exists");
     TEST_ASSERT(filesEqual(originalProjectDir / "data" / "binary.bin",
                            reconstructedDir / "data" / "binary.bin"), "data/binary.bin matches byte-for-byte");
@@ -346,25 +359,37 @@ int main() {
     // 2. One-byte file
     test_file_sizes_transfer(1, "size_1_byte");
 
-    // 3. Small file (1 KiB)
+    // 3. 100 bytes (small partial block)
+    test_file_sizes_transfer(100, "size_100_bytes");
+
+    // 4. Small file (1 KiB)
     test_file_sizes_transfer(1024, "size_1_kib");
 
-    // 4. Exact buffer boundary (64 KiB)
+    // 5. Exact buffer boundary (64 KiB)
     test_file_sizes_transfer(64 * 1024, "size_exact_64_kib");
 
-    // 5. Larger than buffer (150 KiB)
+    // 6. 65 KiB (boundary + 1, multiple blocks with final partial block)
+    test_file_sizes_transfer(65 * 1024, "size_65_kib");
+
+    // 7. Larger than buffer (150 KiB)
     test_file_sizes_transfer(150 * 1024, "size_150_kib");
 
-    // 6. 1 MiB file
+    // 8. 1 MiB file (exact queue capacity of 16 blocks)
     test_file_sizes_transfer(1024 * 1024, "size_1_mib");
 
-    // 7. 5 MiB file
+    // 9. 5 MiB file (wraps around ring buffer multiple times)
     test_file_sizes_transfer(5 * 1024 * 1024, "size_5_mib");
 
-    // 8. Binary with embedded null bytes
+    // 10. 10 MiB file (160 blocks, wraps around ring buffer 10 times)
+    test_file_sizes_transfer(10 * 1024 * 1024, "size_10_mib");
+
+    // 11. Binary with embedded null bytes
     test_binary_with_null_bytes();
 
-    // 9. Full End-to-End Pipeline & Reconstruction Test
+    // 12. Binary containing all 256 byte values
+    test_binary_all_byte_values();
+
+    // 13. Full End-to-End Pipeline & Reconstruction Test
     test_end_to_end_pipeline_and_reconstruction();
 
     std::cout << "========================================\n";

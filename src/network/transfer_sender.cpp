@@ -103,6 +103,7 @@ bool TransferSender::streamFileWithQueue(socket_t sock,
                                          uint64_t fileSize,
                                          MessageType messageType,
                                          const std::string& displayLabel,
+                                         bool verbose,
                                          std::string& error) {
     std::ifstream file(filePath, std::ios::binary);
     if (!file) {
@@ -123,7 +124,9 @@ bool TransferSender::streamFileWithQueue(socket_t sock,
     }
 
     if (fileSize == 0) {
-        printProgress(displayLabel, 0, 0, std::chrono::steady_clock::now());
+        if (verbose) {
+            printProgress(displayLabel, 0, 0, std::chrono::steady_clock::now());
+        }
         return true;
     }
 
@@ -167,7 +170,7 @@ bool TransferSender::streamFileWithQueue(socket_t sock,
 
             file.seekg(static_cast<std::streamoff>(desc.file_offset), std::ios::beg);
             file.read(reinterpret_cast<char*>(buffer.data()), desc.block_size);
-            if (!file) {
+            if (file.bad() || static_cast<size_t>(file.gcount()) != desc.block_size) {
                 error = "Failed reading block " + std::to_string(desc.block_index) +
                         " from " + filePath;
                 transfer_queue_destroy(&queue);
@@ -181,7 +184,9 @@ bool TransferSender::streamFileWithQueue(socket_t sock,
             }
 
             bytesTransferred += desc.block_size;
-            printProgress(displayLabel, bytesTransferred, fileSize, startTime);
+            if (verbose) {
+                printProgress(displayLabel, bytesTransferred, fileSize, startTime);
+            }
         }
     }
 
@@ -267,6 +272,11 @@ bool TransferSender::send(const SenderConfig& config, std::string& error) {
         error = "Handshake failed: " + error;
         return false;
     }
+    if (ackHdr.type == static_cast<uint16_t>(MessageType::ERROR_MSG)) {
+        std::string remoteErr(ackPayload.begin(), ackPayload.end());
+        error = "Receiver rejected handshake: " + (remoteErr.empty() ? "Remote error" : remoteErr);
+        return false;
+    }
     if (ackHdr.type != static_cast<uint16_t>(MessageType::HELLO_ACK)) {
         error = "Expected HELLO_ACK, received " + messageTypeToString(static_cast<MessageType>(ackHdr.type));
         return false;
@@ -295,6 +305,11 @@ bool TransferSender::send(const SenderConfig& config, std::string& error) {
         error = "Failed to receive TRANSFER_INFO_ACK: " + error;
         return false;
     }
+    if (ackHdr.type == static_cast<uint16_t>(MessageType::ERROR_MSG)) {
+        std::string remoteErr(ackPayload.begin(), ackPayload.end());
+        error = "Receiver rejected transfer info: " + (remoteErr.empty() ? "Remote error" : remoteErr);
+        return false;
+    }
     if (ackHdr.type != static_cast<uint16_t>(MessageType::TRANSFER_INFO_ACK)) {
         error = "Expected TRANSFER_INFO_ACK, received " + messageTypeToString(static_cast<MessageType>(ackHdr.type));
         return false;
@@ -303,12 +318,17 @@ bool TransferSender::send(const SenderConfig& config, std::string& error) {
     // 9. Send Manifest
     if (config.verbose) std::cout << "[Sender] Streaming manifest: " << manifestFilename << "...\n";
     if (!streamFileWithQueue(sock, config.manifestPath, manifestSize, MessageType::MANIFEST,
-                             "Manifest " + manifestFilename, error)) {
+                             "Manifest " + manifestFilename, config.verbose, error)) {
         return false;
     }
 
     if (!receiveFramedMessage(sock, ackHdr, ackPayload, error)) {
         error = "Failed to receive MANIFEST_ACK: " + error;
+        return false;
+    }
+    if (ackHdr.type == static_cast<uint16_t>(MessageType::ERROR_MSG)) {
+        std::string remoteErr(ackPayload.begin(), ackPayload.end());
+        error = "Receiver rejected manifest: " + (remoteErr.empty() ? "Remote error" : remoteErr);
         return false;
     }
     if (ackHdr.type != static_cast<uint16_t>(MessageType::MANIFEST_ACK)) {
@@ -319,12 +339,17 @@ bool TransferSender::send(const SenderConfig& config, std::string& error) {
     // 10. Send Payload (.rtpack)
     if (config.verbose) std::cout << "[Sender] Streaming payload: " << payloadFilename << " (using C circular queue)...\n";
     if (!streamFileWithQueue(sock, config.payloadPath, payloadSize, MessageType::PAYLOAD,
-                             "Payload  " + payloadFilename, error)) {
+                             "Payload  " + payloadFilename, config.verbose, error)) {
         return false;
     }
 
     if (!receiveFramedMessage(sock, ackHdr, ackPayload, error)) {
         error = "Failed to receive PAYLOAD_ACK: " + error;
+        return false;
+    }
+    if (ackHdr.type == static_cast<uint16_t>(MessageType::ERROR_MSG)) {
+        std::string remoteErr(ackPayload.begin(), ackPayload.end());
+        error = "Receiver rejected payload: " + (remoteErr.empty() ? "Remote error" : remoteErr);
         return false;
     }
     if (ackHdr.type != static_cast<uint16_t>(MessageType::PAYLOAD_ACK)) {
@@ -341,6 +366,11 @@ bool TransferSender::send(const SenderConfig& config, std::string& error) {
 
     if (!receiveFramedMessage(sock, ackHdr, ackPayload, error)) {
         error = "Failed to receive COMPLETE_ACK: " + error;
+        return false;
+    }
+    if (ackHdr.type == static_cast<uint16_t>(MessageType::ERROR_MSG)) {
+        std::string remoteErr(ackPayload.begin(), ackPayload.end());
+        error = "Receiver failed transfer finalization: " + (remoteErr.empty() ? "Remote error" : remoteErr);
         return false;
     }
     if (ackHdr.type != static_cast<uint16_t>(MessageType::COMPLETE_ACK)) {

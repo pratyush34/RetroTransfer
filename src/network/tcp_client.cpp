@@ -69,16 +69,73 @@ bool TcpClient::connect(const std::string& host, uint16_t port, int timeoutMs) {
     int flag = 1;
     setsockopt(socketFd_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&flag), sizeof(flag));
 
-    // Set connection/socket timeout (15 seconds default)
-    setSocketTimeout(socketFd_, timeoutMs);
+    // Put socket in non-blocking mode to implement genuine connection timeout
+#ifdef _WIN32
+    u_long nonBlocking = 1;
+    ioctlsocket(socketFd_, FIONBIO, &nonBlocking);
+#else
+    int origFlags = fcntl(socketFd_, F_GETFL, 0);
+    fcntl(socketFd_, F_SETFL, origFlags | O_NONBLOCK);
+#endif
 
-    if (::connect(socketFd_, addrResult->ai_addr, static_cast<int>(addrResult->ai_addrlen)) == SOCKET_CALL_ERROR) {
-        lastError_ = "Failed to connect to " + host + ":" + portStr + ": " + getLastSocketError();
+    int connRes = ::connect(socketFd_, addrResult->ai_addr, static_cast<int>(addrResult->ai_addrlen));
+    bool connectSuccess = false;
+
+    if (connRes == 0) {
+        connectSuccess = true;
+    } else {
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) {
+#else
+        if (errno == EINPROGRESS) {
+#endif
+            fd_set writeFds, exceptFds;
+            FD_ZERO(&writeFds);
+            FD_ZERO(&exceptFds);
+            FD_SET(socketFd_, &writeFds);
+            FD_SET(socketFd_, &exceptFds);
+
+            struct timeval tv;
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+
+            int sel = select(static_cast<int>(socketFd_ + 1), nullptr, &writeFds, &exceptFds, (timeoutMs > 0 ? &tv : nullptr));
+            if (sel == 0) {
+                lastError_ = "Connection to " + host + ":" + portStr + " timed out after " + std::to_string(timeoutMs) + " ms";
+            } else if (sel < 0) {
+                lastError_ = "Select failed during connect: " + getLastSocketError();
+            } else {
+                int soError = 0;
+                socklen_t soLen = sizeof(soError);
+                if (getsockopt(socketFd_, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soError), &soLen) < 0 || soError != 0) {
+                    lastError_ = "Failed to connect to " + host + ":" + portStr + " (socket error: " + std::to_string(soError) + ")";
+                } else {
+                    connectSuccess = true;
+                }
+            }
+        } else {
+            lastError_ = "Failed to initiate connect to " + host + ":" + portStr + ": " + getLastSocketError();
+        }
+    }
+
+    // Restore socket to blocking mode
+#ifdef _WIN32
+    u_long blocking = 0;
+    ioctlsocket(socketFd_, FIONBIO, &blocking);
+#else
+    fcntl(socketFd_, F_SETFL, origFlags);
+#endif
+
+    if (!connectSuccess) {
         closeSocket(socketFd_);
         socketFd_ = INVALID_SOCKET_FD;
         freeaddrinfo(addrResult);
         return false;
     }
+
+    // Set receive and send timeouts for data phase
+    setSocketTimeout(socketFd_, timeoutMs);
 
     freeaddrinfo(addrResult);
     connected_ = true;
