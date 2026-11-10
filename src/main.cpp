@@ -3,6 +3,8 @@
 #include "chunk_config.h"
 #include "compression_engine.h"
 #include "reconstruction_engine.h"
+#include "network/transfer_sender.h"
+#include "network/transfer_receiver.h"
 
 #include <algorithm>
 #include <chrono>
@@ -329,11 +331,25 @@ static void writeChunkManifestJson(std::ofstream& out,
 }
 
 static void printUsage(const char* progName) {
-    std::cout << "RetroTransfer - Project Scanner and Adaptive Chunking Engine\n";
+    std::cout << "RetroTransfer - Incremental Project Transfer and Chunking System\n";
     std::cout << "Usage:\n";
-    std::cout << "  " << progName << " [directory] [scan.json] [options]\n\n";
+    std::cout << "  " << progName << " send --manifest <manifest.json> --payload <payload.rtpack> --ip <receiver_ip> [--port <port>]\n";
+    std::cout << "  " << progName << " receive [--port <port>] [--output <directory>] [--auto-reconstruct]\n\n";
+    std::cout << "  " << progName << " [directory] [scan.json] [options]\n";
     std::cout << "  " << progName << " --reconstruct <chunks.json> --output <directory> [--payload <file.rtpack>]\n\n";
-    std::cout << "Arguments:\n";
+    std::cout << "Network Commands:\n";
+    std::cout << "  send                  Stream manifest and payload bundle to remote receiver over TCP\n";
+    std::cout << "    --manifest <file>   Path to project chunk manifest JSON\n";
+    std::cout << "    --payload <file>    Path to .rtpack payload bundle\n";
+    std::cout << "    --ip <address>      Receiver IP address or hostname\n";
+    std::cout << "    --port <port>       Receiver port (default: 8080)\n";
+    std::cout << "    --timeout <ms>      Connection timeout in ms (default: 10000)\n\n";
+    std::cout << "  receive               Run TCP receiver server to accept and store project transfer\n";
+    std::cout << "    --port <port>       Port to listen on (default: 8080)\n";
+    std::cout << "    --output <dir>      Destination directory for immediate reconstruction\n";
+    std::cout << "    --auto-reconstruct  Reconstruct without interactive confirmation\n";
+    std::cout << "    --base-dir <dir>    Storage directory for received projects (default: \"received_projects\")\n\n";
+    std::cout << "Local Chunking Arguments:\n";
     std::cout << "  [directory]           Root directory to scan (default: \".\")\n";
     std::cout << "  [scan.json]           Legacy positional scan filename inside collection/\n\n";
     std::cout << "Options:\n";
@@ -422,7 +438,143 @@ static void runBenchmark(const DirectoryNode& directoryTree,
     std::cout << "============================================================\n\n";
 }
 
+static int handleSendCommand(int argc, char* argv[]) {
+    retro::net::SenderConfig config;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: RetroTransfer send --manifest <manifest.json> --payload <payload.rtpack> --ip <receiver_ip> [--port <port>]\n";
+            return 0;
+        } else if (arg == "--manifest") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --manifest requires a path argument.\n";
+                return 2;
+            }
+            config.manifestPath = argv[++i];
+        } else if (arg == "--payload") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --payload requires a path argument.\n";
+                return 2;
+            }
+            config.payloadPath = argv[++i];
+        } else if (arg == "--ip") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --ip requires an IP address or hostname.\n";
+                return 2;
+            }
+            config.receiverIp = argv[++i];
+        } else if (arg == "--port") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --port requires a port number.\n";
+                return 2;
+            }
+            try {
+                int p = std::stoi(argv[++i]);
+                if (p <= 0 || p > 65535) {
+                    std::cerr << "Error: Port must be between 1 and 65535.\n";
+                    return 2;
+                }
+                config.receiverPort = static_cast<uint16_t>(p);
+            } catch (...) {
+                std::cerr << "Error: Invalid port number: " << argv[i] << "\n";
+                return 2;
+            }
+        } else if (arg == "--timeout") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --timeout requires milliseconds value.\n";
+                return 2;
+            }
+            config.connectionTimeoutMs = std::stoi(argv[++i]);
+        } else {
+            std::cerr << "Error: Unrecognized send option: " << arg << "\n";
+            return 2;
+        }
+    }
+
+    if (config.manifestPath.empty()) {
+        std::cerr << "Error: --manifest is required for sending.\n";
+        return 2;
+    }
+    if (config.payloadPath.empty()) {
+        std::cerr << "Error: --payload is required for sending.\n";
+        return 2;
+    }
+    if (config.receiverIp.empty()) {
+        std::cerr << "Error: --ip is required for sending.\n";
+        return 2;
+    }
+
+    retro::net::TransferSender sender;
+    std::string error;
+    if (!sender.send(config, error)) {
+        std::cerr << "Error: File transfer failed: " << error << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+static int handleReceiveCommand(int argc, char* argv[]) {
+    retro::net::ReceiverConfig config;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: RetroTransfer receive [--port <port>] [--output <directory>] [--auto-reconstruct] [--base-dir <dir>]\n";
+            return 0;
+        } else if (arg == "--port") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --port requires a port number.\n";
+                return 2;
+            }
+            try {
+                int p = std::stoi(argv[++i]);
+                if (p <= 0 || p > 65535) {
+                    std::cerr << "Error: Port must be between 1 and 65535.\n";
+                    return 2;
+                }
+                config.port = static_cast<uint16_t>(p);
+            } catch (...) {
+                std::cerr << "Error: Invalid port number: " << argv[i] << "\n";
+                return 2;
+            }
+        } else if (arg == "--output") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --output requires a directory path.\n";
+                return 2;
+            }
+            config.autoReconstructDir = argv[++i];
+        } else if (arg == "--auto-reconstruct") {
+            config.interactive = false;
+        } else if (arg == "--base-dir") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --base-dir requires a directory path.\n";
+                return 2;
+            }
+            config.baseStorageDir = argv[++i];
+        } else {
+            std::cerr << "Error: Unrecognized receive option: " << arg << "\n";
+            return 2;
+        }
+    }
+
+    retro::net::TransferReceiver receiver;
+    retro::net::ReceivedFiles files;
+    std::string error;
+    if (!receiver.receive(config, files, error)) {
+        std::cerr << "Error: Receiver failed: " << error << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
+    if (argc > 1 && (std::string(argv[1]) == "send" || std::string(argv[1]) == "--send")) {
+        return handleSendCommand(argc, argv);
+    }
+    if (argc > 1 && (std::string(argv[1]) == "receive" || std::string(argv[1]) == "--receive")) {
+        return handleReceiveCommand(argc, argv);
+    }
     if (argc > 1 && std::string(argv[1]) == "--reconstruct") {
         if (argc < 3 || std::string(argv[2]).rfind("--", 0) == 0) {
             std::cerr << "Error: --reconstruct requires a chunk manifest path.\n";
