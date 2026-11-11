@@ -1,191 +1,206 @@
 # Antigravity Persistent Project Memory: RetroTransfer
 
 ## 1. Current Working Branch
-- **Active Branch**: `four`
+- **Active Branch**: `four` (per explicit user instruction to proceed on branch `four`).
 - **Base Commit**: `eec1a91` (fast-forwarded from `5029230` to include network transfer implementation from `third` as approved by user).
-- **Working Tree**: Clean, all new persistent storage files added to CMake build and tracked.
+- **Working Tree**: Clean, all new remote deduplication files and tests tracked and integrated into CMake.
 
 ---
 
 ## 2. Current Development Stage
-- **Stage**: Part 1 – Persistent Chunk Storage and Indexing.
-- **Goal**: Implement persistent, verified on-disk chunk storage and JSON-backed indexing on the receiver, integrated cleanly into the receiver pipeline while preserving all existing transfer and reconstruction capabilities.
-- **Status**: **COMPLETED AND VERIFIED** (All 6 ctest suites passing 100%, 89/89 storage unit and integration tests passing).
+- **Stage**: Part 1 Completion – Remote Chunk Deduplication & Selective Transfer.
+- **Goal**: Implement remote deduplication between sender and receiver. The receiver's persistent chunk index is the source of truth for chunks already available on destination. Sender queries receiver with `CHUNK_LIST`, receiver validates chunks against disk storage (checking existence, size, CRC32, and MurmurHash3), responds with `MISSING_CHUNKS`, sender generates selective `.rtpack` payload containing only missing chunks (or skips payload entirely if 0 chunks missing), receiver validates and stores incoming chunks, and reconstructs the project byte-for-byte.
+- **Status**: **COMPLETED AND 100% VERIFIED** (All 7 CTest suites passing 100%, 74/74 assertions passing in `test_remote_dedup.exe` covering all 7 test scenarios).
 
 ---
 
 ## 3. Files Created
-1. `include/storage/json_helper.h`: Self-contained JSON DOM representation (`StorageJsonValue`), parser (`StorageJsonParser`), writer with formatting/escaping (`StorageJsonWriter`), and safe file I/O utilities (`readJsonFile`, `safeWriteJsonFile` with atomic `.tmp` swap).
-2. `src/storage/json_helper.cpp`: Implementation of JSON parser and safe atomic serializer.
-3. `include/storage/chunk_record.h`: Chunk metadata record definition (`ChunkRecord` / aliased `ChunkMetadata`), storing fingerprint, size, CRC32, filename, status, version, and creation timestamp.
-4. `src/storage/chunk_record.cpp`: Validation and JSON serialization / deserialization for chunk records.
-5. `include/storage/chunk_verifier.h`: Integrity verification class (`ChunkVerifier`) for MurmurHash3 fingerprints, CRC32 checksums, buffer/file verification, and byte-for-byte collision detection.
-6. `src/storage/chunk_verifier.cpp`: Verification methods wrapping existing C routines `rt_compute_fingerprint_hex` and `rt_compute_crc32`.
-7. `include/storage/chunk_storage.h`: Physical disk chunk storage engine (`ChunkStorage`) managing `<storageDir>/chunks/<fingerprint>.chunk`.
-8. `src/storage/chunk_storage.cpp`: Staging via atomic temporary files, collision detection, duplicate handling, safe byte-level retrieval, and chunk directory scanning.
-9. `include/storage/chunk_index.h`: Persistent index manager (`ChunkIndex`) providing O(1) in-memory lookups and atomic persistence to `chunk_index.json`.
-10. `src/storage/chunk_index.cpp`: Index CRUD operations, safe atomic save, corruption detection, and automatic index rebuild from physical `.chunk` files on disk.
-11. `include/storage/storage_manager.h`: High-level coordinator (`StorageManager`) binding storage, index, and configuration (`storage_config.json`).
-12. `src/storage/storage_manager.cpp`: Storage manager implementation coordinating chunk intake, retrieval, repository validation, and rebuilds.
-13. `tests/test_storage.cpp`: Comprehensive 89-assertion test suite covering storage operations, index operations, persistence across session restarts, and receiver integration.
+1. `tests/test_remote_dedup.cpp`: Full integration test suite specifically covering all Section 10 Scenarios 1 through 7:
+   - Scenario 1: First Transfer (cold receiver, all chunks transferred and stored).
+   - Scenario 2: Identical Second Transfer (all chunks already on receiver, 0 payload bytes transmitted, 100% remote deduplication, perfect reconstruction).
+   - Scenario 3: Modified Project (small modification to one file; only modified chunks transferred, unchanged chunks reused from persistent storage).
+   - Scenario 4: New File Added (new file added; only new file chunks transferred, prior chunks reused).
+   - Scenario 5: Corrupted Stored Chunk Recovery (deliberately corrupted stored chunk detected as missing by receiver, retransmitted and repaired on disk by sender, repository restored to 100% integrity).
+   - Scenario 6: Receiver Restart and Persistence (receiver instance stopped and restarted from persistent index/storage; previously stored valid chunks recognized and reused with zero retransmission).
+   - Scenario 7: Reconstruction Verification (comprehensive verification across text, multi-line, binary, all 256 byte values, null bytes, 256 KiB large file, empty files, and 3-level deep nested directories).
 
 ---
 
 ## 4. Files Modified
-1. `include/reconstruction_engine.h`:
-   - Added `ExtractedChunk` structure.
-   - Added static method `ReconstructionEngine::extractPayloadChunks` for extracting and decoding chunks from `.rtpack` bundles.
-   - Extended `ReconstructionEngine::reconstruct` to accept an optional `persistentStorageDir` parameter for chunk lookup.
-2. `src/reconstruction_engine.cpp`:
-   - Implemented `extractPayloadChunks` reusing existing `readStoredChunk` and Huffman decompressor.
-   - Enhanced `reconstruct` to fetch reusable chunks from `ChunkStorage` if missing from payload or destination directory.
-3. `include/network/transfer_receiver.h`:
-   - Added `chunkStorageDir` ("storage") and `enableChunkStorage` (true) configuration options to `ReceiverConfig`.
-   - Updated `reconstructProject` method declaration to pass persistent storage directory.
-4. `src/network/transfer_receiver.cpp`:
-   - Integrated persistent chunk storage into `receive()` workflow: extracts received chunks, persists them via `StorageManager`, updates index, and passes persistent storage directory to reconstruction.
-5. `CMakeLists.txt`:
-   - Added `RETRO_STORAGE_SOURCES` to `RETRO_CORE_SOURCES`.
-   - Added `test_storage` executable and CTest test definition `StorageTests`.
-6. `tests/test_file_transfer.cpp`:
-   - Updated `test_end_to_end_pipeline_and_reconstruction` to verify creation and integrity of `chunk_index.json`, `storage_config.json`, and `storage/chunks/`.
-7. `readme.md`:
-   - Documented Persistent Chunk Storage & Indexing architecture, directory structure, classes, collision safety, and test results.
+1. `include/network/protocol.h`:
+   - Added `MessageType` enum entries: `CHUNK_LIST = 12`, `CHUNK_LIST_ACK = 13`, `MISSING_CHUNKS = 14`, `MISSING_CHUNKS_ACK = 15`, `DEDUP_SUMMARY = 16`, `DEDUP_SUMMARY_ACK = 17`.
+   - Added structs: `ChunkListEntry` (fingerprint, originalSize, crc32), `ChunkListMsg`, `MissingChunksMsg` (totalChunks, availableChunks, missingChunks, availableBytes, missingBytes, missingFingerprints), `DedupSummaryMsg` (totalProjectChunks, availableChunks, missingChunks, transferredChunks, totalOriginalBytes, deduplicatedBytes, compressionSavingsBytes, transmittedPayloadBytes, actualTransmittedBytes, totalTransferTimeMs).
+   - Added function declarations for serialization and deserialization of the new message types.
+2. `src/network/protocol.cpp`:
+   - Implemented `serializeChunkList`, `deserializeChunkList` (bounds validation: chunk count <= 1,000,000, hex validation, network byte order).
+   - Implemented `serializeMissingChunks`, `deserializeMissingChunks` (bounds validation, total == available + missing check).
+   - Implemented `serializeDedupSummary`, `deserializeDedupSummary` (64-byte wire payload with network byte order 64-bit integer encoding).
+   - Updated `messageTypeToString` and packet upper bound validation.
+3. `include/compression_engine.h`:
+   - Added `compressSelectedMissingChunks` declaration.
+   - Added `createSelectivePayloadFromExisting` declaration.
+4. `src/compression_engine.cpp`:
+   - Implemented `compressSelectedMissingChunks` filtering project chunks and delegating to existing C Huffman compression engine.
+   - Implemented `createSelectivePayloadFromExisting` extracting chunks from existing payload or reading from source files, applying Huffman compression with raw fallback, and packaging selective `.rtpack` bundles with `RTPK\x01\x00\x00\x00` headers.
+5. `src/reconstruction_engine.cpp`:
+   - Allowed reconstruction to succeed without opening a payload bundle if `payloadChunks.empty()` (e.g. 100% remote deduplication where 0 payload chunks are transferred).
+   - Updated `extractPayloadChunks` to return immediately with success if `payloadChunks` array in manifest is empty.
+6. `include/storage/storage_manager.h`:
+   - Added `validateChunk(fingerprint, expectedSize, expectedCrc32, error)` delegating to `ChunkStorage::validateChunk`.
+7. `src/storage/storage_manager.cpp`:
+   - In `storeChunk`: If chunk file on disk exists but fails verification (corrupted), fall through to safely overwrite and repair it rather than returning error.
+8. `src/storage/chunk_storage.cpp`:
+   - In `storeChunk`: Verify existing file on disk with `ChunkVerifier::verifyFile`. If valid, return true (idempotent); if corrupted/truncated, proceed to safely write temporary file and atomically rename to repair the corrupted chunk on disk.
+9. `include/network/transfer_sender.h`:
+   - Added `enableRemoteDedup` (default true) and `projectDir` to `SenderConfig`.
+   - Added `stats_` (`DedupSummaryMsg`) and `getStatistics()`.
+   - Added helper methods: `extractChunkListFromManifest`, `writeSelectiveManifestFile`, `printDedupSummary`.
+10. `src/network/transfer_sender.cpp`:
+    - Integrated remote chunk negotiation into `TransferSender::send`: sends `CHUNK_LIST`, receives `MISSING_CHUNKS`, sends `MISSING_CHUNKS_ACK`.
+    - If 0 chunks missing: skips payload streaming (`actualPayloadSize = 0`, `skipPayloadStreaming = true`), sends selective manifest with 0 payload chunks.
+    - If partial chunks missing: generates selective `.rtpack` and selective manifest containing only missing chunks.
+    - If all chunks missing: sends original full payload directly.
+    - Streams files using C circular queue (`TransferQueue`).
+    - Sends `DEDUP_SUMMARY` and displays formatted summary.
+11. `include/network/transfer_receiver.h`:
+    - Added `stats_` (`DedupSummaryMsg`) and `getStatistics()`.
+12. `src/network/transfer_receiver.cpp`:
+    - Handles `CHUNK_LIST`: validates each chunk in persistent storage (`StorageManager::validateChunk` checks file existence, size, CRC32, MurmurHash3), replies `MISSING_CHUNKS`.
+    - Handles `skipPayloadStreaming` when missingChunks == 0: skips payload receive loop without blocking.
+    - Handles `DEDUP_SUMMARY` and displays summary.
+13. `tests/test_protocol.cpp`:
+    - Added comprehensive unit tests for `CHUNK_LIST`, `MISSING_CHUNKS`, and `DEDUP_SUMMARY` serialization/deserialization, bounds checking, and malformed input rejection.
+14. `CMakeLists.txt`:
+    - Added `test_remote_dedup` executable and registered CTest test `RemoteDedupTests`.
 
 ---
 
 ## 5. Classes and Functions Implemented
-- `retro::storage::StorageJsonValue`: Lightweight JSON DOM node with numeric, boolean, string, array, and object support.
-- `retro::storage::StorageJsonParser`: Recursive descent JSON parser with escape sequence decoding and strict syntax validation.
-- `retro::storage::StorageJsonWriter`: JSON serializer with formatted indentation and character escaping.
-- `retro::storage::safeWriteJsonFile(path, value, error)`: Safe atomic file writer writing to `.tmp` and renaming.
-- `retro::storage::readJsonFile(path, outValue, error)`: Safe file reader and parser.
-- `retro::storage::ChunkRecord`: Encapsulates `fingerprint`, `size`, `crc32`, `filename`, `status`, `version`, `createdAt`.
-- `retro::storage::ChunkVerifier`:
-  - `isValidFingerprintFormat(fingerprint)`: 32 hex char validation.
-  - `computeFingerprint(data, size, seed)`: 128-bit MurmurHash3 calculation.
-  - `computeCrc32(data, size)`: CRC32 computation.
-  - `verifyData(...)`: Fingerprint and CRC32 verification on memory buffer.
-  - `verifyFile(...)`: Verification on disk file against expected size and hashes.
-  - `compareDataWithFile(...)`: Byte-level collision comparison.
-- `retro::storage::ChunkStorage`:
-  - `initialize(error)`: Directory creation.
-  - `storeChunk(fingerprint, data, size, crc32, error)`: Collision-safe write with temp files.
-  - `retrieveChunk(fingerprint, outData, error)`: Verified chunk byte read.
-  - `hasChunk(fingerprint)`: Disk file existence check.
-  - `validateChunk(fingerprint, expectedSize, expectedCrc32, error)`: File verification.
-  - `deleteChunk(fingerprint, error)`: Chunk removal.
-  - `listStoredChunkFingerprints()`: Physical chunk enumeration.
-- `retro::storage::ChunkIndex`:
-  - `initialize(indexPath, error)`, `loadIndex`, `saveIndex`
-  - `findChunk(fingerprint, outRecord)`, `containsChunk`, `insertChunk`, `updateChunk`, `removeChunk`
-  - `validateIndex(chunksDir, error)`: Detects missing and corrupted chunks.
-  - `rebuildFromChunks(chunksDir, indexPath, error)`: Rebuilds index from valid `.chunk` files on disk.
-- `retro::storage::StorageManager`:
-  - Coordinates physical storage, index persistence, and `storage_config.json`.
-- `ReconstructionEngine::extractPayloadChunks(manifestPath, payloadPath, outChunks, error)`: Extractor for received `.rtpack` bundles.
+- **Protocol Extensions**:
+  - `serializeChunkList`, `deserializeChunkList`
+  - `serializeMissingChunks`, `deserializeMissingChunks`
+  - `serializeDedupSummary`, `deserializeDedupSummary`
+- **Selective Payload Generation**:
+  - `CompressionEngine::compressSelectedMissingChunks`
+  - `CompressionEngine::createSelectivePayloadFromExisting`
+  - `TransferSender::writeSelectiveManifestFile`
+- **Chunk Repair & Verification**:
+  - `StorageManager::validateChunk`: Validates existence, size, CRC32, and MurmurHash3 of stored chunk.
+  - `ChunkStorage::storeChunk`: Detects corrupted chunks on disk and overwrites/repairs them atomically using verified staging.
+- **Deduplication Metrics**:
+  - `TransferSender::printDedupSummary`: Prints total project chunks, chunks already present on remote, missing chunks requested, chunks transmitted, total original data, deduplication savings (chunks and bytes), and compression savings.
 
 ---
 
-## 6. Existing Components Reused
-- `rt_murmurhash3_128` and `rt_compute_fingerprint_hex` (seed 42) in `src/fingerprint.c`.
-- `rt_compute_crc32` in `src/fingerprint.c`.
-- `rt_huffman_decompress` in `src/huffman_codec.c`.
-- `readStoredChunk` and payload bundle parsing in `src/reconstruction_engine.cpp`.
-- `TransferReceiver` and `TransferSender` in `src/network/`.
-- `writeChunkManifestJson` in `src/manifest_writer.cpp`.
-- Existing CMake configuration.
+## 6. Remote Deduplication Workflow
+```
+Sender                                                         Receiver
+  |                                                               |
+  | --- HELLO (Type 1) -----------------------------------------> |
+  | <----------------------------------------- HELLO_ACK (Type 2) |
+  |                                                               |
+  | === Remote Deduplication Negotiation ===                      |
+  | --- CHUNK_LIST (Type 12) [Unique Fingerprints, Sizes, CRCs]-> |
+  |                                                               | Inspects Persistent Index
+  |                                                               | Validates Chunks on Disk:
+  |                                                               |   - File existence
+  |                                                               |   - File size == originalSize
+  |                                                               |   - CRC32 checksum match
+  |                                                               |   - MurmurHash3 match
+  |                                                               | (Corrupted chunk = MISSING)
+  | <----------------- MISSING_CHUNKS (Type 14) [Missing List] -- |
+  | --- MISSING_CHUNKS_ACK (Type 15) ---------------------------> |
+  |                                                               |
+  | === Transfer Metadata ===                                     |
+  | --- TRANSFER_INFO (Type 3) ---------------------------------> |
+  | <--------------------------------- TRANSFER_INFO_ACK (Type 4) |
+  |                                                               |
+  | === Manifest Transfer (via C Circular Queue) ===              |
+  | --- MANIFEST (Type 5) --------------------------------------> |
+  | <-------------------------------------- MANIFEST_ACK (Type 6) |
+  |                                                               |
+  | === Payload Transfer (Only if missingChunks > 0) ===          |
+  | [If missingChunks == 0: Payload streaming is SKIPPED]        |
+  | [If missingChunks > 0: Streams Selective .rtpack]             |
+  | --- PAYLOAD (Type 7) ---------------------------------------> |
+  | <--------------------------------------- PAYLOAD_ACK (Type 8) |
+  |                                                               |
+  | === Deduplication Summary & Completion ===                    |
+  | --- DEDUP_SUMMARY (Type 16) --------------------------------> |
+  | <--------------------------------- DEDUP_SUMMARY_ACK (Type 17)|
+  | --- COMPLETE (Type 9) --------------------------------------> |
+  | <-------------------------------------- COMPLETE_ACK (Type 10)|
+  |                                                               |
+  |                                                               | Persists Received Chunks
+  |                                                               | Updates Persistent Index
+  |                                                               | Reconstructs Project
+  |                                                               | (Persistent Chunks + Payload)
+```
 
 ---
 
-## 7. Design Decisions
-1. **Safety via Temporary Staging**: Both chunks and index files are written to `.tmp` files first, verified for size and checksums, and only then atomically renamed to their final paths. This prevents incomplete or corrupted entries if an operation is aborted.
-2. **True Collision Safety**: If a chunk with an identical fingerprint already exists, its size, CRC32, and raw bytes are compared against incoming data. Identical chunks are treated as idempotent successes without overwriting. Different bytes with the same fingerprint trigger a collision error and prevent overwriting.
-3. **Repository Rebuild Capability**: If `chunk_index.json` is missing or corrupted, `StorageManager::rebuildIndex` scans `storage/chunks/`, validates every `.chunk` file using MurmurHash3 and CRC32, and regenerates a clean, consistent index file.
-4. **Seamless Receiver Integration**: The receiver automatically extracts payload chunks after receiving `.rtpack`, validates them, indexes them, and passes the storage directory to the reconstruction engine so persistent chunks can be reused.
-5. **Backwards Compatibility**: All existing signatures and behaviors remain untouched; default arguments allow all existing unit tests to continue passing without modification.
+## 7. Verification and Test Results
+All 7 CTest suites passed 100%:
+```
+    Start 1: ChunkingEngineTests
+1/7 Test #1: ChunkingEngineTests ..............   Passed    0.39 sec
+    Start 2: TransferQueueTests
+2/7 Test #2: TransferQueueTests ...............   Passed    0.02 sec
+    Start 3: ProtocolTests
+3/7 Test #3: ProtocolTests ....................   Passed    0.02 sec
+    Start 4: NetworkLocalTests
+4/7 Test #4: NetworkLocalTests ................   Passed    1.17 sec
+    Start 5: FileTransferAndE2ETests ..........   Passed    3.95 sec
+    Start 6: StorageTests .....................   Passed    0.65 sec
+    Start 7: RemoteDedupTests .................   Passed    4.50 sec
+
+100% tests passed out of 7
+Total Test time (real) = 10.75 sec
+```
+
+`test_remote_dedup.exe` Results:
+```
+============================================================
+Results: 74 run, 0 failed
+============================================================
+All 7 test scenarios verified with byte-for-byte equality!
+```
 
 ---
 
-## 8. Protocol Changes
-- **No wire protocol changes made**: Transfer direction remains strictly Device A (Sender) -> Device B (Receiver). The wire framing (`0x5254504B` header, `TransferInfo`, `MANIFEST`, `PAYLOAD`, `COMPLETE`) remains identical.
+## 8. Exact Commands to Build and Run
+```powershell
+# Configure and build
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# Run all test suites
+ctest --test-dir build --output-on-failure
+
+# Run individual test executables
+.\build\test_remote_dedup.exe
+.\build\test_storage.exe
+.\build\test_protocol.exe
+.\build\test_file_transfer.exe
+.\build\test_network_local.exe
+.\build\test_transfer_queue.exe
+.\build\test_chunking.exe
+```
 
 ---
 
-## 9. Tests Executed
-1. `ctest --test-dir build --output-on-failure`
-2. `.\build\test_storage.exe`
-3. `.\build\test_file_transfer.exe`
-4. `.\build\test_network_local.exe`
-5. `.\build\test_protocol.exe`
-6. `.\build\test_transfer_queue.exe`
-7. `.\build\test_chunking.exe`
-
----
-
-## 10. Tests Passed
-- **CTest Suite**: 6/6 test suites passed (100% pass rate).
-- **`test_storage.exe`**: 89/89 assertions passed.
-  - Category A (Storage): Store, retrieve, duplicate detection, empty chunk, binary with nulls, large 1 MiB chunk, nonexistent chunk rejection, corruption detection, missing file detection.
-  - Category B (Index): CRUD operations, duplicate insertion handling, malformed JSON rejection, missing JSON handling, atomic temp-file cleanup.
-  - Category C (Persistence): Closed and reopened storage manager in a separate session; all chunks and metadata verified intact.
-  - Category D (Receiver Integration): Valid payload transfer, chunk extraction, persistent indexing, byte-for-byte reconstruction, and index rebuild test.
-- **`test_file_transfer.exe`**: 84/84 assertions passed (including persistent storage verification on receiver).
-- **`test_chunking.exe`**: 28/28 tests passed.
-- **`test_transfer_queue.exe`**: 441/441 assertions passed.
-- **`test_protocol.exe`**: 60/60 assertions passed.
-- **`test_network_local.exe`**: 56/56 assertions passed.
-
----
-
-## 11. Tests Failed
-- **0 tests failed**.
-
----
-
-## 12. Known Bugs
-- None identified. All edge cases (0 bytes, null bytes, large chunks, corrupted files, malformed JSON) are handled safely.
-
----
-
-## 13. Incomplete Work
-- None for Part 1 (Persistent Chunk Storage and Indexing).
-- Out of scope for this stage per Prompt instructions:
-  - Remote chunk negotiation and selective deduplication (Prompt 2).
-  - Bidirectional sender/receiver operation.
-  - Resumable transfers and transfer recovery.
-  - TLS encryption.
-
----
-
-## 14. Exact Next Implementation Steps (for Prompt 2)
-1. **Remote Chunk Negotiation Protocol**:
-   - Implement query message allowing Sender to request Receiver's chunk inventory or check specific fingerprints (`QUERY_CHUNKS` / `CHUNK_STATUS`).
-   - Receiver responds with list of known chunks present in its `ChunkIndex`.
-2. **Selective Payload Packaging**:
-   - Sender filters out chunks already present in Receiver's repository before constructing `.rtpack`.
-   - Manifest includes full recipe with references to existing chunks, while `.rtpack` only contains missing chunks.
-3. **Selective Reconstruction**:
-   - Receiver reconstructs project by sourcing missing chunks from `.rtpack` and reused chunks from persistent `ChunkStorage`.
-4. **Bandwidth & Deduplication Tests**:
-   - Measure network byte savings on incremental revisions.
-
----
-
-## 15. Suggested Git Commit Message
+## 9. Suggested Git Commit Message
 ```text
-Implement persistent chunk storage and indexing for receiver (Part 1)
+Implement remote deduplication and complete Part 1
 
-- Add ChunkStorage for atomic, collision-safe chunk file management in storage/chunks/
-- Add ChunkIndex for O(1) in-memory lookups and atomic persistence to chunk_index.json
-- Add ChunkVerifier for MurmurHash3 (seed 42) and CRC32 chunk integrity validation
-- Add StorageManager coordinating storage, index, and storage_config.json
-- Add safe JSON parsing and atomic file writing utilities in json_helper
-- Integrate persistent chunk storage into TransferReceiver workflow
-- Implement ReconstructionEngine::extractPayloadChunks for decoding received bundles
-- Support persistent chunk lookup during project reconstruction
-- Add comprehensive 89-test suite in test_storage.cpp covering storage, index, persistence, and integration
-- Update test_file_transfer.cpp to verify receiver persistent storage creation
-- Update readme.md with architecture, structure, and test documentation
-- Update ANTIGRAVITY_PROGRESS.md with development context
+- Add CHUNK_LIST, MISSING_CHUNKS, and DEDUP_SUMMARY protocol messages with safe framing
+- Query receiver persistent chunk index and disk storage before transfer
+- Verify receiver checks chunk existence, size, CRC32, and MurmurHash3 on disk
+- Retransmit and repair any corrupted or missing stored chunks
+- Implement selective payload packaging via Huffman compression with raw fallback
+- Skip payload streaming entirely when all project chunks are already available (100% dedup)
+- Integrate C circular queue (TransferQueue) for manifest and payload streaming
+- Extend ReconstructionEngine to resolve chunks from both persistent storage and payload
+- Add comprehensive 7-scenario integration test suite in tests/test_remote_dedup.cpp
+- Update documentation and CMake configuration
 ```

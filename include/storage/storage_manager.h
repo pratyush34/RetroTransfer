@@ -60,6 +60,16 @@ public:
     bool hasChunk(const std::string& fingerprint) const;
 
     /*
+     * Validates a stored chunk on disk against expected size and CRC32.
+     */
+    bool validateChunk(const std::string& fingerprint,
+                       uint64_t expectedSize,
+                       uint32_t expectedCrc32,
+                       std::string& error) const {
+        return storage_.validateChunk(fingerprint, expectedSize, expectedCrc32, error);
+    }
+
+    /*
      * Deletes a chunk from both storage and index.
      */
     bool deleteChunk(const std::string& fingerprint, std::string& error);

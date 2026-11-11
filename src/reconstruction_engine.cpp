@@ -645,24 +645,27 @@ bool ReconstructionEngine::reconstruct(const std::string& manifestPath,
                                      static_cast<size_t>(cdcMax));
 
         std::error_code ec;
-        const uintmax_t bundleSize = fs::file_size(bundlePath, ec);
-        if (ec || bundleSize < 8) {
-            throw std::runtime_error("Could not read a valid RTPK payload bundle: " +
-                                     bundlePath.string());
-        }
-        std::ifstream payload(bundlePath, std::ios::binary);
-        char header[8] = {};
-        payload.read(header, sizeof(header));
-        if (!payload || std::string(header, header + 4) != "RTPK" ||
-            static_cast<unsigned char>(header[4]) != 1 ||
-            header[5] != 0 || header[6] != 0 || header[7] != 0) {
-            throw std::runtime_error("Payload bundle has an invalid or unsupported RTPK header.");
-        }
-        for (const auto& entry : payloadChunks) {
-            const PayloadChunk& chunk = entry.second;
-            if (chunk.offset < 8 || chunk.offset > bundleSize ||
-                chunk.storedSize > bundleSize - chunk.offset) {
-                throw std::runtime_error("Payload chunk points outside the bundle file.");
+        std::ifstream payload;
+        if (!payloadChunks.empty()) {
+            const uintmax_t bundleSize = fs::file_size(bundlePath, ec);
+            if (ec || bundleSize < 8) {
+                throw std::runtime_error("Could not read a valid RTPK payload bundle: " +
+                                         bundlePath.string());
+            }
+            payload.open(bundlePath, std::ios::binary);
+            char header[8] = {};
+            payload.read(header, sizeof(header));
+            if (!payload || std::string(header, header + 4) != "RTPK" ||
+                static_cast<unsigned char>(header[4]) != 1 ||
+                header[5] != 0 || header[6] != 0 || header[7] != 0) {
+                throw std::runtime_error("Payload bundle has an invalid or unsupported RTPK header.");
+            }
+            for (const auto& entry : payloadChunks) {
+                const PayloadChunk& chunk = entry.second;
+                if (chunk.offset < 8 || chunk.offset > bundleSize ||
+                    chunk.storedSize > bundleSize - chunk.offset) {
+                    throw std::runtime_error("Payload chunk points outside the bundle file.");
+                }
             }
         }
 
@@ -890,6 +893,9 @@ bool ReconstructionEngine::extractPayloadChunks(const std::string& manifestPath,
         const JsonValue& compression = selectiveIt->second;
         const auto payloadChunksIt = compression.object.find("payloadChunks");
         if (payloadChunksIt == compression.object.end() || payloadChunksIt->second.type != JsonValue::Type::Array) {
+            return true;
+        }
+        if (payloadChunksIt->second.array.empty()) {
             return true;
         }
 

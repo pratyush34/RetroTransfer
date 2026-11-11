@@ -26,7 +26,13 @@ enum class MessageType : uint16_t {
     PAYLOAD_ACK       = 8,
     COMPLETE          = 9,
     COMPLETE_ACK      = 10,
-    ERROR_MSG         = 11
+    ERROR_MSG         = 11,
+    CHUNK_LIST        = 12,
+    CHUNK_LIST_ACK    = 13,
+    MISSING_CHUNKS    = 14,
+    MISSING_CHUNKS_ACK= 15,
+    DEDUP_SUMMARY     = 16,
+    DEDUP_SUMMARY_ACK = 17
 };
 
 std::string messageTypeToString(MessageType type);
@@ -50,6 +56,41 @@ struct TransferInfo {
 };
 
 /*
+ * Remote deduplication message structures.
+ */
+struct ChunkListEntry {
+    std::string fingerprint; // 32 hex characters
+    uint64_t originalSize = 0;
+    uint32_t crc32 = 0;
+};
+
+struct ChunkListMsg {
+    std::vector<ChunkListEntry> chunks;
+};
+
+struct MissingChunksMsg {
+    uint32_t totalChunks = 0;
+    uint32_t availableChunks = 0;
+    uint32_t missingChunks = 0;
+    uint64_t availableBytes = 0;
+    uint64_t missingBytes = 0;
+    std::vector<std::string> missingFingerprints;
+};
+
+struct DedupSummaryMsg {
+    uint32_t totalProjectChunks = 0;
+    uint32_t availableChunks = 0;
+    uint32_t missingChunks = 0;
+    uint32_t transferredChunks = 0;
+    uint64_t totalOriginalBytes = 0;
+    uint64_t deduplicatedBytes = 0;
+    uint64_t transmittedPayloadBytes = 0;
+    uint64_t compressionSavingsBytes = 0;
+    uint64_t actualTransmittedBytes = 0;
+    uint64_t totalTransferTimeMs = 0;
+};
+
+/*
  * Header serialization & deserialization.
  * Enforces network byte order (big endian) and rigorous validation.
  */
@@ -61,6 +102,18 @@ bool deserializeHeader(const uint8_t* buffer, size_t size, PacketHeader& outHead
  */
 bool serializeTransferInfo(const TransferInfo& info, std::vector<uint8_t>& out);
 bool deserializeTransferInfo(const uint8_t* buffer, size_t size, TransferInfo& outInfo, std::string& error);
+
+/*
+ * Remote deduplication message serialization & deserialization.
+ */
+bool serializeChunkList(const ChunkListMsg& msg, std::vector<uint8_t>& out);
+bool deserializeChunkList(const uint8_t* buffer, size_t size, ChunkListMsg& outMsg, std::string& error);
+
+bool serializeMissingChunks(const MissingChunksMsg& msg, std::vector<uint8_t>& out);
+bool deserializeMissingChunks(const uint8_t* buffer, size_t size, MissingChunksMsg& outMsg, std::string& error);
+
+bool serializeDedupSummary(const DedupSummaryMsg& msg, std::vector<uint8_t>& out);
+bool deserializeDedupSummary(const uint8_t* buffer, size_t size, DedupSummaryMsg& outMsg, std::string& error);
 
 /*
  * Safe filename validation to protect against directory traversal and malicious paths.

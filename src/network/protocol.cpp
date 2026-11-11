@@ -2,12 +2,21 @@
 
 #include <cstring>
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <iostream>
 
 namespace retro::net {
 
 namespace {
+
+static inline bool isValidHexFingerprint(const std::string& fp) {
+    if (fp.size() != 32) return false;
+    for (char c : fp) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+    }
+    return true;
+}
 
 static inline uint16_t hostToNet16(uint16_t val) {
     return htons(val);
@@ -118,6 +127,12 @@ std::string messageTypeToString(MessageType type) {
         case MessageType::COMPLETE: return "COMPLETE";
         case MessageType::COMPLETE_ACK: return "COMPLETE_ACK";
         case MessageType::ERROR_MSG: return "ERROR";
+        case MessageType::CHUNK_LIST: return "CHUNK_LIST";
+        case MessageType::CHUNK_LIST_ACK: return "CHUNK_LIST_ACK";
+        case MessageType::MISSING_CHUNKS: return "MISSING_CHUNKS";
+        case MessageType::MISSING_CHUNKS_ACK: return "MISSING_CHUNKS_ACK";
+        case MessageType::DEDUP_SUMMARY: return "DEDUP_SUMMARY";
+        case MessageType::DEDUP_SUMMARY_ACK: return "DEDUP_SUMMARY_ACK";
         default: return "UNKNOWN (" + std::to_string(static_cast<uint16_t>(type)) + ")";
     }
 }
@@ -160,7 +175,7 @@ bool deserializeHeader(const uint8_t* buffer, size_t size, PacketHeader& outHead
         return false;
     }
     if (type < static_cast<uint16_t>(MessageType::HELLO) ||
-        type > static_cast<uint16_t>(MessageType::ERROR_MSG)) {
+        type > static_cast<uint16_t>(MessageType::DEDUP_SUMMARY_ACK)) {
         error = "Invalid or unrecognized message type: " + std::to_string(type);
         return false;
     }
@@ -232,6 +247,160 @@ bool deserializeTransferInfo(const uint8_t* buffer, size_t size, TransferInfo& o
     outInfo.transferId = transferId;
     outInfo.manifestFilename = manifestName;
     outInfo.payloadFilename = payloadName;
+    return true;
+}
+
+bool serializeChunkList(const ChunkListMsg& msg, std::vector<uint8_t>& out) {
+    out.clear();
+    uint32_t count = static_cast<uint32_t>(msg.chunks.size());
+    out.reserve(4 + static_cast<size_t>(count) * 44);
+    writeUint32(out, count);
+    for (const auto& chunk : msg.chunks) {
+        if (chunk.fingerprint.size() != 32) return false;
+        out.insert(out.end(), chunk.fingerprint.begin(), chunk.fingerprint.end());
+        writeUint64(out, chunk.originalSize);
+        writeUint32(out, chunk.crc32);
+    }
+    return true;
+}
+
+bool deserializeChunkList(const uint8_t* buffer, size_t size, ChunkListMsg& outMsg, std::string& error) {
+    outMsg.chunks.clear();
+    if (size < 4) {
+        error = "CHUNK_LIST payload truncated (minimum 4 bytes required)";
+        return false;
+    }
+    size_t offset = 0;
+    uint32_t count = 0;
+    if (!readUint32(buffer, size, offset, count)) {
+        error = "Failed to read chunk count in CHUNK_LIST";
+        return false;
+    }
+    constexpr uint32_t MAX_CHUNKS = 1000000;
+    if (count > MAX_CHUNKS) {
+        error = "CHUNK_LIST chunk count exceeds maximum allowed limit (1,000,000): " + std::to_string(count);
+        return false;
+    }
+    if (size != 4 + static_cast<size_t>(count) * 44) {
+        error = "CHUNK_LIST payload size mismatch: expected " +
+                std::to_string(4 + static_cast<size_t>(count) * 44) + " bytes, got " + std::to_string(size);
+        return false;
+    }
+    outMsg.chunks.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string fp(reinterpret_cast<const char*>(buffer + offset), 32);
+        offset += 32;
+        if (!isValidHexFingerprint(fp)) {
+            error = "Invalid fingerprint format at index " + std::to_string(i) + " in CHUNK_LIST: " + fp;
+            return false;
+        }
+        uint64_t origSize = 0;
+        uint32_t crc = 0;
+        readUint64(buffer, size, offset, origSize);
+        readUint32(buffer, size, offset, crc);
+        ChunkListEntry entry;
+        entry.fingerprint = std::move(fp);
+        entry.originalSize = origSize;
+        entry.crc32 = crc;
+        outMsg.chunks.push_back(std::move(entry));
+    }
+    return true;
+}
+
+bool serializeMissingChunks(const MissingChunksMsg& msg, std::vector<uint8_t>& out) {
+    out.clear();
+    uint32_t missingCount = static_cast<uint32_t>(msg.missingFingerprints.size());
+    out.reserve(28 + static_cast<size_t>(missingCount) * 32);
+    writeUint32(out, msg.totalChunks);
+    writeUint32(out, msg.availableChunks);
+    writeUint32(out, missingCount);
+    writeUint64(out, msg.availableBytes);
+    writeUint64(out, msg.missingBytes);
+    for (const auto& fp : msg.missingFingerprints) {
+        if (fp.size() != 32) return false;
+        out.insert(out.end(), fp.begin(), fp.end());
+    }
+    return true;
+}
+
+bool deserializeMissingChunks(const uint8_t* buffer, size_t size, MissingChunksMsg& outMsg, std::string& error) {
+    outMsg = {};
+    if (size < 28) {
+        error = "MISSING_CHUNKS payload truncated (minimum 28 bytes required)";
+        return false;
+    }
+    size_t offset = 0;
+    uint32_t total = 0;
+    uint32_t avail = 0;
+    uint32_t missing = 0;
+    uint64_t availBytes = 0;
+    uint64_t missingBytes = 0;
+    readUint32(buffer, size, offset, total);
+    readUint32(buffer, size, offset, avail);
+    readUint32(buffer, size, offset, missing);
+    readUint64(buffer, size, offset, availBytes);
+    readUint64(buffer, size, offset, missingBytes);
+
+    if (total != avail + missing) {
+        error = "MISSING_CHUNKS inconsistent counts: total=" + std::to_string(total) +
+                " != available(" + std::to_string(avail) + ") + missing(" + std::to_string(missing) + ")";
+        return false;
+    }
+    if (size != 28 + static_cast<size_t>(missing) * 32) {
+        error = "MISSING_CHUNKS payload size mismatch: expected " +
+                std::to_string(28 + static_cast<size_t>(missing) * 32) + " bytes, got " + std::to_string(size);
+        return false;
+    }
+    outMsg.totalChunks = total;
+    outMsg.availableChunks = avail;
+    outMsg.missingChunks = missing;
+    outMsg.availableBytes = availBytes;
+    outMsg.missingBytes = missingBytes;
+    outMsg.missingFingerprints.reserve(missing);
+    for (uint32_t i = 0; i < missing; ++i) {
+        std::string fp(reinterpret_cast<const char*>(buffer + offset), 32);
+        offset += 32;
+        if (!isValidHexFingerprint(fp)) {
+            error = "Invalid fingerprint in MISSING_CHUNKS: " + fp;
+            return false;
+        }
+        outMsg.missingFingerprints.push_back(std::move(fp));
+    }
+    return true;
+}
+
+bool serializeDedupSummary(const DedupSummaryMsg& msg, std::vector<uint8_t>& out) {
+    out.clear();
+    out.reserve(64);
+    writeUint32(out, msg.totalProjectChunks);
+    writeUint32(out, msg.availableChunks);
+    writeUint32(out, msg.missingChunks);
+    writeUint32(out, msg.transferredChunks);
+    writeUint64(out, msg.totalOriginalBytes);
+    writeUint64(out, msg.deduplicatedBytes);
+    writeUint64(out, msg.transmittedPayloadBytes);
+    writeUint64(out, msg.compressionSavingsBytes);
+    writeUint64(out, msg.actualTransmittedBytes);
+    writeUint64(out, msg.totalTransferTimeMs);
+    return true;
+}
+
+bool deserializeDedupSummary(const uint8_t* buffer, size_t size, DedupSummaryMsg& outMsg, std::string& error) {
+    if (size < 64) {
+        error = "DEDUP_SUMMARY payload truncated: expected 64 bytes, got " + std::to_string(size);
+        return false;
+    }
+    size_t offset = 0;
+    readUint32(buffer, size, offset, outMsg.totalProjectChunks);
+    readUint32(buffer, size, offset, outMsg.availableChunks);
+    readUint32(buffer, size, offset, outMsg.missingChunks);
+    readUint32(buffer, size, offset, outMsg.transferredChunks);
+    readUint64(buffer, size, offset, outMsg.totalOriginalBytes);
+    readUint64(buffer, size, offset, outMsg.deduplicatedBytes);
+    readUint64(buffer, size, offset, outMsg.transmittedPayloadBytes);
+    readUint64(buffer, size, offset, outMsg.compressionSavingsBytes);
+    readUint64(buffer, size, offset, outMsg.actualTransmittedBytes);
+    readUint64(buffer, size, offset, outMsg.totalTransferTimeMs);
     return true;
 }
 

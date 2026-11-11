@@ -238,12 +238,90 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
         return false;
     }
 
-    // 2. Transfer Info: Expect TRANSFER_INFO, reply TRANSFER_INFO_ACK
+    bool skipPayloadStreaming = false;
+
+    // 2. Expect either CHUNK_LIST (remote deduplication) or TRANSFER_INFO (direct)
     if (!receiveFramedMessage(clientSock, hdr, payload, error)) {
-        error = "Failed to receive TRANSFER_INFO: " + error;
+        error = "Failed to receive message after handshake: " + error;
         closeSocket(clientSock);
         return false;
     }
+
+    if (hdr.type == static_cast<uint16_t>(MessageType::CHUNK_LIST)) {
+        ChunkListMsg clMsg;
+        if (!deserializeChunkList(payload.data(), payload.size(), clMsg, error)) {
+            sendErrorMessage(clientSock, error);
+            closeSocket(clientSock);
+            return false;
+        }
+
+        if (config.verbose) {
+            std::cout << "[Receiver] Received CHUNK_LIST query with " << clMsg.chunks.size() << " chunks\n";
+            std::cout << "[Receiver] Inspecting persistent chunk storage (" << config.chunkStorageDir << ")...\n";
+        }
+
+        retro::storage::StorageManager storageMgr(config.chunkStorageDir);
+        std::string sErr;
+        storageMgr.initialize(sErr);
+
+        uint32_t availableChunks = 0;
+        uint32_t missingChunks = 0;
+        uint64_t availableBytes = 0;
+        uint64_t missingBytes = 0;
+        std::vector<std::string> missingFps;
+
+        for (const auto& chk : clMsg.chunks) {
+            std::string valErr;
+            // The chunk must exist on disk and pass size, CRC32, and MurmurHash3 checks
+            if (storageMgr.hasChunk(chk.fingerprint) &&
+                storageMgr.validateChunk(chk.fingerprint, chk.originalSize, chk.crc32, valErr)) {
+                availableChunks++;
+                availableBytes += chk.originalSize;
+            } else {
+                missingChunks++;
+                missingBytes += chk.originalSize;
+                missingFps.push_back(chk.fingerprint);
+            }
+        }
+
+        if (config.verbose) {
+            std::cout << "[Receiver] Chunk inventory: " << availableChunks << " available ("
+                      << (availableBytes / 1024) << " KB), " << missingChunks << " missing ("
+                      << (missingBytes / 1024) << " KB)\n";
+        }
+
+        MissingChunksMsg mcMsg;
+        mcMsg.totalChunks = static_cast<uint32_t>(clMsg.chunks.size());
+        mcMsg.availableChunks = availableChunks;
+        mcMsg.missingChunks = missingChunks;
+        mcMsg.availableBytes = availableBytes;
+        mcMsg.missingBytes = missingBytes;
+        mcMsg.missingFingerprints = missingFps;
+        skipPayloadStreaming = (missingChunks == 0);
+
+        std::vector<uint8_t> mcBytes;
+        serializeMissingChunks(mcMsg, mcBytes);
+        if (!sendFramedMessage(clientSock, MessageType::MISSING_CHUNKS, mcBytes)) {
+            error = "Failed to send MISSING_CHUNKS: " + getLastSocketError();
+            closeSocket(clientSock);
+            return false;
+        }
+
+        // Wait for MISSING_CHUNKS_ACK
+        if (!receiveFramedMessage(clientSock, hdr, payload, error)) {
+            error = "Failed to receive MISSING_CHUNKS_ACK: " + error;
+            closeSocket(clientSock);
+            return false;
+        }
+
+        // Now receive TRANSFER_INFO
+        if (!receiveFramedMessage(clientSock, hdr, payload, error)) {
+            error = "Failed to receive TRANSFER_INFO after negotiation: " + error;
+            closeSocket(clientSock);
+            return false;
+        }
+    }
+
     if (hdr.type != static_cast<uint16_t>(MessageType::TRANSFER_INFO)) {
         error = "Unexpected message in state WAIT_TRANSFER_INFO: " + messageTypeToString(static_cast<MessageType>(hdr.type));
         sendErrorMessage(clientSock, error);
@@ -341,49 +419,66 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
         return false;
     }
 
-    // 4. Payload: Expect PAYLOAD, stream to temp file, reply PAYLOAD_ACK
-    if (!receivePacketHeader(clientSock, hdr, error)) {
-        error = "Failed to receive PAYLOAD header: " + error;
-        closeSocket(clientSock);
-        return false;
-    }
-    if (hdr.type != static_cast<uint16_t>(MessageType::PAYLOAD)) {
-        error = "Unexpected message in state WAIT_PAYLOAD: " + messageTypeToString(static_cast<MessageType>(hdr.type));
-        sendErrorMessage(clientSock, error);
-        closeSocket(clientSock);
-        return false;
-    }
-    if (hdr.payloadLength != tInfo.payloadSize) {
-        error = "PAYLOAD header length (" + std::to_string(hdr.payloadLength) +
-                ") does not match TRANSFER_INFO size (" + std::to_string(tInfo.payloadSize) + ")";
-        sendErrorMessage(clientSock, error);
-        closeSocket(clientSock);
-        return false;
+    // 4. Payload: Expect PAYLOAD unless skipped by remote deduplication
+    fs::path finalPayloadPath;
+    if (!skipPayloadStreaming) {
+        finalPayloadPath = transferDir / tInfo.payloadFilename;
+        fs::path tempPayloadPath = transferDir / (tInfo.payloadFilename + ".tmp");
+
+        if (!receivePacketHeader(clientSock, hdr, error)) {
+            error = "Failed to receive PAYLOAD header: " + error;
+            closeSocket(clientSock);
+            return false;
+        }
+        if (hdr.type != static_cast<uint16_t>(MessageType::PAYLOAD)) {
+            error = "Unexpected message in state WAIT_PAYLOAD: " + messageTypeToString(static_cast<MessageType>(hdr.type));
+            sendErrorMessage(clientSock, error);
+            closeSocket(clientSock);
+            return false;
+        }
+        if (hdr.payloadLength != tInfo.payloadSize) {
+            error = "PAYLOAD header length (" + std::to_string(hdr.payloadLength) +
+                    ") does not match TRANSFER_INFO size (" + std::to_string(tInfo.payloadSize) + ")";
+            sendErrorMessage(clientSock, error);
+            closeSocket(clientSock);
+            return false;
+        }
+
+        if (config.verbose) std::cout << "[Receiver] Receiving payload bundle...\n";
+        if (!receiveStreamedFile(clientSock, tempPayloadPath.string(), finalPayloadPath.string(),
+                                 tInfo.payloadSize, "payload", config.verbose, error)) {
+            sendErrorMessage(clientSock, error);
+            closeSocket(clientSock);
+            return false;
+        }
+
+        if (!sendFramedMessage(clientSock, MessageType::PAYLOAD_ACK, {})) {
+            error = "Failed to send PAYLOAD_ACK: " + getLastSocketError();
+            closeSocket(clientSock);
+            return false;
+        }
+    } else if (config.verbose) {
+        std::cout << "[Receiver] Zero payload chunks required; payload streaming skipped.\n";
     }
 
-    fs::path finalPayloadPath = transferDir / tInfo.payloadFilename;
-    fs::path tempPayloadPath = transferDir / (tInfo.payloadFilename + ".tmp");
-
-    if (config.verbose) std::cout << "[Receiver] Receiving payload bundle...\n";
-    if (!receiveStreamedFile(clientSock, tempPayloadPath.string(), finalPayloadPath.string(),
-                             tInfo.payloadSize, "payload", config.verbose, error)) {
-        sendErrorMessage(clientSock, error);
-        closeSocket(clientSock);
-        return false;
-    }
-
-    if (!sendFramedMessage(clientSock, MessageType::PAYLOAD_ACK, {})) {
-        error = "Failed to send PAYLOAD_ACK: " + getLastSocketError();
-        closeSocket(clientSock);
-        return false;
-    }
-
-    // 5. Complete: Expect COMPLETE, reply COMPLETE_ACK
+    // 5. Complete / Dedup Summary: Expect DEDUP_SUMMARY or COMPLETE
     if (!receiveFramedMessage(clientSock, hdr, payload, error)) {
-        error = "Failed to receive COMPLETE: " + error;
+        error = "Failed to receive message after payload: " + error;
         closeSocket(clientSock);
         return false;
     }
+
+    if (hdr.type == static_cast<uint16_t>(MessageType::DEDUP_SUMMARY)) {
+        deserializeDedupSummary(payload.data(), payload.size(), stats_, error);
+        sendFramedMessage(clientSock, MessageType::DEDUP_SUMMARY_ACK, {});
+
+        if (!receiveFramedMessage(clientSock, hdr, payload, error)) {
+            error = "Failed to receive COMPLETE after DEDUP_SUMMARY: " + error;
+            closeSocket(clientSock);
+            return false;
+        }
+    }
+
     if (hdr.type != static_cast<uint16_t>(MessageType::COMPLETE)) {
         error = "Unexpected message in state WAIT_COMPLETE: " + messageTypeToString(static_cast<MessageType>(hdr.type));
         sendErrorMessage(clientSock, error);
@@ -392,8 +487,14 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
     }
 
     // Final integrity verification of stored files
-    if (!fs::exists(finalManifestPath, ec) || !fs::exists(finalPayloadPath, ec)) {
-        error = "Received files verification failed on disk";
+    if (!fs::exists(finalManifestPath, ec)) {
+        error = "Received manifest verification failed on disk";
+        sendErrorMessage(clientSock, error);
+        closeSocket(clientSock);
+        return false;
+    }
+    if (!skipPayloadStreaming && !fs::exists(finalPayloadPath, ec)) {
+        error = "Received payload verification failed on disk";
         sendErrorMessage(clientSock, error);
         closeSocket(clientSock);
         return false;
@@ -409,7 +510,7 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
 
     outFiles.transferId = tInfo.transferId;
     outFiles.manifestPath = finalManifestPath.string();
-    outFiles.payloadPath = finalPayloadPath.string();
+    outFiles.payloadPath = (!skipPayloadStreaming) ? finalPayloadPath.string() : "";
     outFiles.manifestSize = tInfo.manifestSize;
     outFiles.payloadSize = tInfo.payloadSize;
 
@@ -486,7 +587,47 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
         }
     }
 
+    if (config.verbose && stats_.totalProjectChunks > 0) {
+        printDedupSummary(stats_, 0.0);
+    }
+
     return true;
+}
+
+void TransferReceiver::printDedupSummary(const DedupSummaryMsg& stats, double elapsedSec) {
+    double speedMBps = (elapsedSec > 0.001)
+        ? ((stats.transmittedPayloadBytes / (1024.0 * 1024.0)) / elapsedSec)
+        : 0.0;
+    double dedupPercent = (stats.totalProjectChunks > 0)
+        ? (100.0 * stats.availableChunks / stats.totalProjectChunks)
+        : 0.0;
+    double missingPercent = (stats.totalProjectChunks > 0)
+        ? (100.0 * stats.missingChunks / stats.totalProjectChunks)
+        : 0.0;
+
+    std::cout << "\n============================================================\n";
+    std::cout << "        RECEIVER DEDUPLICATION & RECONSTRUCTION             \n";
+    std::cout << "============================================================\n";
+    std::cout << "Total Project Chunks     : " << stats.totalProjectChunks << "\n";
+    std::cout << "Chunks Available Locally : " << stats.availableChunks << " ("
+              << std::fixed << std::setprecision(1) << dedupPercent << "% deduplicated)\n";
+    std::cout << "Missing Chunks Transferred: " << stats.missingChunks << " ("
+              << std::fixed << std::setprecision(1) << missingPercent << "%)\n";
+    std::cout << "Chunks Received          : " << stats.transferredChunks << "\n";
+    std::cout << "Total Original Data      : " << stats.totalOriginalBytes << " bytes ("
+              << (stats.totalOriginalBytes / 1024) << " KB)\n";
+    std::cout << "Deduplication Savings    : " << stats.deduplicatedBytes << " bytes ("
+              << (stats.deduplicatedBytes / 1024) << " KB saved from wire)\n";
+    std::cout << "Transmitted Payload Wire : " << stats.transmittedPayloadBytes << " bytes ("
+              << (stats.transmittedPayloadBytes / 1024) << " KB)\n";
+    std::cout << "Compression Savings      : " << stats.compressionSavingsBytes << " bytes\n";
+    if (elapsedSec > 0.0) {
+        std::cout << "Total Transfer Time      : " << std::fixed << std::setprecision(2)
+                  << (elapsedSec * 1000.0) << " ms\n";
+        std::cout << "Transfer Speed           : " << std::fixed << std::setprecision(2)
+                  << speedMBps << " MB/s\n";
+    }
+    std::cout << "============================================================\n";
 }
 
 bool TransferReceiver::reconstructProject(const std::string& manifestPath,

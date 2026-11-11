@@ -152,6 +152,12 @@ static void test_all_message_types() {
     TEST_ASSERT(messageTypeToString(MessageType::COMPLETE) == "COMPLETE", "Type COMPLETE string");
     TEST_ASSERT(messageTypeToString(MessageType::COMPLETE_ACK) == "COMPLETE_ACK", "Type COMPLETE_ACK string");
     TEST_ASSERT(messageTypeToString(MessageType::ERROR_MSG) == "ERROR", "Type ERROR string");
+    TEST_ASSERT(messageTypeToString(MessageType::CHUNK_LIST) == "CHUNK_LIST", "Type CHUNK_LIST string");
+    TEST_ASSERT(messageTypeToString(MessageType::CHUNK_LIST_ACK) == "CHUNK_LIST_ACK", "Type CHUNK_LIST_ACK string");
+    TEST_ASSERT(messageTypeToString(MessageType::MISSING_CHUNKS) == "MISSING_CHUNKS", "Type MISSING_CHUNKS string");
+    TEST_ASSERT(messageTypeToString(MessageType::MISSING_CHUNKS_ACK) == "MISSING_CHUNKS_ACK", "Type MISSING_CHUNKS_ACK string");
+    TEST_ASSERT(messageTypeToString(MessageType::DEDUP_SUMMARY) == "DEDUP_SUMMARY", "Type DEDUP_SUMMARY string");
+    TEST_ASSERT(messageTypeToString(MessageType::DEDUP_SUMMARY_ACK) == "DEDUP_SUMMARY_ACK", "Type DEDUP_SUMMARY_ACK string");
 }
 
 static void test_zero_length_messages() {
@@ -249,6 +255,104 @@ static void test_filename_validation() {
     TEST_ASSERT(!isValidTransferFilename("manifest.json", ".rtpack"), "Rejects mismatched extension");
 }
 
+static void test_chunk_list_serialization() {
+    ChunkListMsg msg;
+    ChunkListEntry e1;
+    e1.fingerprint = "0123456789abcdef0123456789abcdef";
+    e1.originalSize = 4096;
+    e1.crc32 = 0x12345678;
+    msg.chunks.push_back(e1);
+
+    ChunkListEntry e2;
+    e2.fingerprint = "abcdef0123456789abcdef0123456789";
+    e2.originalSize = 8192;
+    e2.crc32 = 0x87654321;
+    msg.chunks.push_back(e2);
+
+    std::vector<uint8_t> buf;
+    TEST_ASSERT(serializeChunkList(msg, buf), "Serialize ChunkListMsg");
+    TEST_ASSERT(buf.size() == 4 + 2 * 44, "ChunkList wire size is 4 + 2*44");
+
+    ChunkListMsg deserialized;
+    std::string err;
+    TEST_ASSERT(deserializeChunkList(buf.data(), buf.size(), deserialized, err), "Deserialize ChunkListMsg");
+    TEST_ASSERT(deserialized.chunks.size() == 2, "Chunk count matches 2");
+    TEST_ASSERT(deserialized.chunks[0].fingerprint == e1.fingerprint, "Entry 1 fingerprint matches");
+    TEST_ASSERT(deserialized.chunks[0].originalSize == 4096, "Entry 1 size matches");
+    TEST_ASSERT(deserialized.chunks[0].crc32 == 0x12345678, "Entry 1 crc32 matches");
+    TEST_ASSERT(deserialized.chunks[1].fingerprint == e2.fingerprint, "Entry 2 fingerprint matches");
+
+    // Test rejection of invalid payload size
+    buf.pop_back();
+    TEST_ASSERT(!deserializeChunkList(buf.data(), buf.size(), deserialized, err), "Rejects truncated CHUNK_LIST");
+}
+
+static void test_missing_chunks_serialization() {
+    MissingChunksMsg msg;
+    msg.totalChunks = 10;
+    msg.availableChunks = 8;
+    msg.missingChunks = 2;
+    msg.availableBytes = 32768;
+    msg.missingBytes = 8192;
+    msg.missingFingerprints = {
+        "1111222233334444aaaabbbbccccdddd",
+        "5555666677778888eeeeffff00001111"
+    };
+
+    std::vector<uint8_t> buf;
+    TEST_ASSERT(serializeMissingChunks(msg, buf), "Serialize MissingChunksMsg");
+    TEST_ASSERT(buf.size() == 28 + 2 * 32, "MissingChunks wire size is 28 + 2*32");
+
+    MissingChunksMsg deserialized;
+    std::string err;
+    TEST_ASSERT(deserializeMissingChunks(buf.data(), buf.size(), deserialized, err), "Deserialize MissingChunksMsg");
+    TEST_ASSERT(deserialized.totalChunks == 10, "Total chunks matches 10");
+    TEST_ASSERT(deserialized.availableChunks == 8, "Available chunks matches 8");
+    TEST_ASSERT(deserialized.missingChunks == 2, "Missing chunks matches 2");
+    TEST_ASSERT(deserialized.availableBytes == 32768, "Available bytes matches 32768");
+    TEST_ASSERT(deserialized.missingBytes == 8192, "Missing bytes matches 8192");
+    TEST_ASSERT(deserialized.missingFingerprints.size() == 2, "Missing fingerprints count matches 2");
+    TEST_ASSERT(deserialized.missingFingerprints[0] == msg.missingFingerprints[0], "Missing fp 0 matches");
+    TEST_ASSERT(deserialized.missingFingerprints[1] == msg.missingFingerprints[1], "Missing fp 1 matches");
+
+    // Inconsistent counts rejection
+    msg.availableChunks = 7; // total(10) != avail(7) + missing(2)
+    serializeMissingChunks(msg, buf);
+    TEST_ASSERT(!deserializeMissingChunks(buf.data(), buf.size(), deserialized, err), "Rejects inconsistent total != avail + missing");
+}
+
+static void test_dedup_summary_serialization() {
+    DedupSummaryMsg msg;
+    msg.totalProjectChunks = 50;
+    msg.availableChunks = 40;
+    msg.missingChunks = 10;
+    msg.transferredChunks = 10;
+    msg.totalOriginalBytes = 200000;
+    msg.deduplicatedBytes = 160000;
+    msg.transmittedPayloadBytes = 18000;
+    msg.compressionSavingsBytes = 22000;
+    msg.actualTransmittedBytes = 25000;
+    msg.totalTransferTimeMs = 150;
+
+    std::vector<uint8_t> buf;
+    TEST_ASSERT(serializeDedupSummary(msg, buf), "Serialize DedupSummaryMsg");
+    TEST_ASSERT(buf.size() == 64, "DedupSummary wire size is 64 bytes");
+
+    DedupSummaryMsg deserialized;
+    std::string err;
+    TEST_ASSERT(deserializeDedupSummary(buf.data(), buf.size(), deserialized, err), "Deserialize DedupSummaryMsg");
+    TEST_ASSERT(deserialized.totalProjectChunks == 50, "Total project chunks 50");
+    TEST_ASSERT(deserialized.availableChunks == 40, "Available chunks 40");
+    TEST_ASSERT(deserialized.missingChunks == 10, "Missing chunks 10");
+    TEST_ASSERT(deserialized.transferredChunks == 10, "Transferred chunks 10");
+    TEST_ASSERT(deserialized.totalOriginalBytes == 200000, "Total original bytes 200000");
+    TEST_ASSERT(deserialized.deduplicatedBytes == 160000, "Deduplicated bytes 160000");
+    TEST_ASSERT(deserialized.transmittedPayloadBytes == 18000, "Transmitted payload bytes 18000");
+    TEST_ASSERT(deserialized.compressionSavingsBytes == 22000, "Compression savings bytes 22000");
+    TEST_ASSERT(deserialized.actualTransmittedBytes == 25000, "Actual transmitted bytes 25000");
+    TEST_ASSERT(deserialized.totalTransferTimeMs == 150, "Total transfer time 150 ms");
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << "        RUNNING PROTOCOL TESTS          \n";
@@ -266,6 +370,9 @@ int main() {
     test_transfer_info_round_trip();
     test_malformed_transfer_info();
     test_filename_validation();
+    test_chunk_list_serialization();
+    test_missing_chunks_serialization();
+    test_dedup_summary_serialization();
 
     std::cout << "========================================\n";
     std::cout << "Results: " << g_tests_run << " run, " << g_tests_failed << " failed\n";

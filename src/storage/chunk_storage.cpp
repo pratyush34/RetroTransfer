@@ -66,13 +66,12 @@ bool ChunkStorage::storeChunk(const std::string& fingerprint,
 
     // Check if chunk is already stored
     if (fs::exists(targetPath, ec)) {
-        // Collision-safety check
-        if (!ChunkVerifier::compareDataWithFile(targetPath, data, size, error)) {
-            error = "Storage conflict: chunk file exists but content does not match (" + error + ")";
-            return false;
+        std::string vErr;
+        if (ChunkVerifier::verifyFile(targetPath, fingerprint, size, crc32, vErr)) {
+            // Identical valid chunk already safely stored
+            return true;
         }
-        // Identical chunk already safely stored
-        return true;
+        // If file on disk fails verification (corrupted or truncated), proceed to safely overwrite/repair it
     }
 
     // Ensure directory exists

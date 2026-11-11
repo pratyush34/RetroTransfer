@@ -116,3 +116,12 @@ add_executable(test_storage
 )
 target_link_libraries(test_storage PRIVATE ${NETWORK_LIBS})
 add_test(NAME StorageTests COMMAND test_storage)
+
+# 6. Remote Deduplication Tests (Section 10 Scenarios 1-7)
+add_executable(test_remote_dedup
+    tests/test_remote_dedup.cpp
+    ${RETRO_CORE_SOURCES}
+    ${RETRO_NETWORK_SOURCES}
+)
+target_link_libraries(test_remote_dedup PRIVATE ${NETWORK_LIBS})
+add_test(NAME RemoteDedupTests COMMAND test_remote_dedup)

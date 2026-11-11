@@ -135,10 +135,11 @@ bool StorageManager::storeChunk(const std::string& fingerprint,
         // Verify physical storage is intact
         if (storage_.hasChunk(fingerprint)) {
             // Confirm byte identical
-            if (!ChunkVerifier::compareDataWithFile(storage_.getChunkPath(fingerprint), data, size, error)) {
-                return false;
+            std::string cmpErr;
+            if (ChunkVerifier::compareDataWithFile(storage_.getChunkPath(fingerprint), data, size, cmpErr)) {
+                return true; // Idempotent duplicate: already safely stored
             }
-            return true; // Idempotent duplicate: already safely stored
+            // If the physical file on disk was corrupted, fall through to overwrite/repair it!
         }
     }
 

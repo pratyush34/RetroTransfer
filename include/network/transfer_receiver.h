@@ -56,8 +56,19 @@ public:
 
     uint16_t getBoundPort() const;
 
+    /*
+     * Retrieve transfer performance and deduplication statistics.
+     */
+    const DedupSummaryMsg& getStatistics() const { return stats_; }
+
 private:
     TcpServer server_;
+    DedupSummaryMsg stats_{};
+
+    /*
+     * Format and print deduplication & transfer summary.
+     */
+    void printDedupSummary(const DedupSummaryMsg& stats, double elapsedSec);
 
     /*
      * Receive a streamed file from socket into temporary file, then rename to final path.

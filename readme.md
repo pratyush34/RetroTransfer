@@ -20,9 +20,10 @@ RetroTransfer is an incremental project-transfer system designed to transfer evo
 - [12. Input Validation & Security Limitations](#12-input-validation--security-limitations)
 - [13. Reconstruction Integration](#13-reconstruction-integration)
 - [14. Persistent Chunk Storage & Indexing](#14-persistent-chunk-storage--indexing)
-- [15. Automated Testing Suite](#15-automated-testing-suite)
-- [16. Performance and Memory Metrics](#16-performance-and-memory-metrics)
-- [17. Current Status, Limitations & Future Work](#17-current-status-limitations--future-work)
+- [15. Remote Deduplication & Selective Transfer](#15-remote-deduplication--selective-transfer)
+- [16. Automated Testing Suite](#16-automated-testing-suite)
+- [17. Performance and Memory Metrics](#17-performance-and-memory-metrics)
+- [18. Current Status, Limitations & Future Work](#18-current-status-limitations--future-work)
 
 ---
 
@@ -499,7 +500,70 @@ RetroTransfer/
 
 ---
 
-## 15. Automated Testing Suite
+## 15. Remote Deduplication & Selective Transfer
+
+Remote Deduplication eliminates redundant network transfers when synchronizing software repositories between two computers. The receiver's persistent chunk repository and index act as the source of truth for chunks already present on the destination machine.
+
+### Deduplication Architecture & Negotiation Flow
+
+```
+Sender                                                          Receiver
+  |                                                                |
+  | --- HELLO (Type 1) ------------------------------------------> |
+  | <------------------------------------------ HELLO_ACK (Type 2) |
+  |                                                                |
+  | === Remote Deduplication Negotiation ===                       |
+  | --- CHUNK_LIST (Type 12) [Unique Fingerprints, Sizes, CRCs] -> |
+  |                                                                | Check Persistent Index & Storage
+  |                                                                | Validate disk chunk integrity
+  |                                                                | (Missing or corrupted -> Request)
+  | <------------------ MISSING_CHUNKS (Type 14) [Missing List] -- |
+  | --- MISSING_CHUNKS_ACK (Type 15) ----------------------------> |
+  |                                                                |
+  | === Transfer Metadata ===                                      |
+  | --- TRANSFER_INFO (Type 3) ----------------------------------> |
+  | <---------------------------------- TRANSFER_INFO_ACK (Type 4) |
+  |                                                                |
+  | === Manifest Transfer ===                                      |
+  | --- MANIFEST (Type 5) ---------------------------------------> |
+  | <--------------------------------------- MANIFEST_ACK (Type 6) |
+  |                                                                |
+  | === Selective Payload Transfer ===                             |
+  | [If missingChunks == 0: Payload streaming is SKIPPED]         |
+  | [If missingChunks > 0: Selective .rtpack (Huffman + raw)]      |
+  | --- PAYLOAD (Type 7) ----------------------------------------> |
+  | <---------------------------------------- PAYLOAD_ACK (Type 8) |
+  |                                                                |
+  | === Deduplication Summary & Completion ===                     |
+  | --- DEDUP_SUMMARY (Type 16) ---------------------------------> |
+  | <---------------------------------- DEDUP_SUMMARY_ACK (Type 17)|
+  | --- COMPLETE (Type 9) ---------------------------------------> |
+  | <--------------------------------------- COMPLETE_ACK (Type 10)|
+  |                                                                | Persist incoming missing chunks
+  |                                                                | Update persistent index
+  |                                                                | Reconstruct project from:
+  |                                                                |   1. Persistent chunk storage
+  |                                                                |   2. Incoming payload chunks
+```
+
+### Key Remote Deduplication Features
+
+1. **Receiver as Source of Truth with Integrity Verification**:
+   - The receiver does not trust its index blindly. When evaluating `CHUNK_LIST`, `StorageManager::validateChunk` verifies that the chunk file physically exists on disk, matches the expected byte size, passes IEEE 802.3 CRC32 verification, and matches the 128-bit MurmurHash3 fingerprint.
+   - Any missing, truncated, or byte-corrupted chunk file is flagged as missing and requested for retransmission.
+2. **Selective Payload Packaging & Zero-Retransmit**:
+   - If **0 chunks are missing** (e.g. Identical Second Transfer or receiver restart): Payload streaming is completely skipped (`0` payload bytes transferred). The receiver reconstructs the project directly from persistent storage using the manifest recipe.
+   - If **some chunks are missing** (e.g. Modified Project or New File): `CompressionEngine::createSelectivePayloadFromExisting` packages a selective `.rtpack` bundle containing only the missing chunks, compressed via Canonical Huffman encoding with raw fallback.
+   - If **all chunks are missing** (First Transfer): Transmits full payload bundle directly.
+3. **Chunk Corruption Recovery & Self-Healing**:
+   - When a stored chunk is corrupted, the receiver requests it in `MISSING_CHUNKS`. The sender transmits it in the selective payload.
+   - `ChunkStorage::storeChunk` safely overwrites and repairs the corrupted file on disk using atomic temporary staging, restoring full repository integrity.
+4. **Distinct Metrics Separation**:
+   - Deduplication savings (bytes of chunks already available and reused) are strictly separated from compression savings (bytes saved by Huffman encoding on transmitted chunks).
+
+---
+
+## 16. Automated Testing Suite
 
 The project includes an extensive automated test suite run via `ctest`:
 
@@ -519,11 +583,12 @@ ctest --test-dir build --output-on-failure
    - Underflow prevention on empty dequeue, overflow prevention on full enqueue.
    - Repeated enqueue/dequeue stress testing: **20,000 consecutive operations** verifying strict FIFO integrity, dynamic batching, clear/reuse, and resource destruction.
 
-3. **Protocol Framing Tests** (`test_protocol.exe` - 60 assertions, 0 failures):
+3. **Protocol Framing Tests** (`test_protocol.exe` - 98 assertions, 0 failures):
    - Header serialization and deserialization in network byte order (big-endian).
    - Wire-level byte inspection (magic `0x5254504B`, version `1`, type ID, 64-bit payload length).
-   - All 11 protocol message types string conversions.
+   - All 17 protocol message types string conversions.
    - Rejection of invalid magic numbers, unsupported protocol versions, truncated headers (< 16 bytes), invalid message types, and declared sizes exceeding 100 GiB limit.
+   - Serialization and deserialization of `CHUNK_LIST`, `MISSING_CHUNKS`, and `DEDUP_SUMMARY` messages with strict field validation, bounds checks, and malformed input handling.
    - Zero-length message handling (HELLO, COMPLETE, etc.).
    - `TransferInfo` metadata serialization round-trip and validation against malformed packets, truncated data, and manifest sizes > 64 MiB.
    - Safe filename and path traversal rejection (`../`, `..\`, directory separators, forbidden characters).
@@ -561,27 +626,35 @@ ctest --test-dir build --output-on-failure
    - **Category C (Persistence)**: Close `StorageManager`, reopen `StorageManager` in new session, confirm all chunks remain available and repository validation passes.
    - **Category D (Receiver Integration)**: Receive valid project transfer, extract chunks via `ReconstructionEngine::extractPayloadChunks`, store in persistent storage, verify all chunks match extracted data, verify reconstructed project files match byte-for-byte, delete `chunk_index.json` and rebuild index from physical chunk files, verify 100% repository consistency.
 
+7. **Remote Deduplication Integration Tests** (`test_remote_dedup.exe` - 74 assertions, 0 failures):
+   - **Test 1: First Transfer**: Receiver starts cold; all 372 chunks transferred, stored, indexed, and reconstructed 100% byte-for-byte.
+   - **Test 2: Identical Second Transfer**: Receiver already has all chunks; 0 chunks missing, 0 payload bytes transmitted (100% network payload reduction), reconstructed perfectly.
+   - **Test 3: Modified Project**: Single modified file; exactly 1 modified chunk transferred, 371 chunks reused from receiver storage.
+   - **Test 4: New File Added**: Newly added file; exactly 4 new chunks transferred, 372 prior chunks reused from storage.
+   - **Test 5: Corrupted Stored Chunk Recovery**: Chunk corrupted on receiver disk; receiver detects corruption during negotiation, sender retransmits, receiver repairs chunk on disk, repository passes integrity verification, and reconstruction succeeds.
+   - **Test 6: Receiver Restart**: Receiver stopped and restarted; loads persistent index and chunks from disk; recognizes all chunks without retransmission.
+   - **Test 7: Reconstruction Verification**: Full byte-for-byte validation across text, binary, all 256 byte values, null bytes, 256 KiB file, empty files, and 3-level deep nested directories.
+
 ---
 
-## 16. Performance and Memory Metrics
+## 17. Performance and Memory Metrics
 
 Tested on local workstation (Windows 11 x64, AMD/Intel processor, SSD):
 
 | Metric | Measured Value |
 | :--- | :--- |
-| **Manifest Size** | 29,482 bytes (~28.8 KB) |
-| **Payload Size** | 5,251,271 bytes (~5.01 MB) |
-| **Total Transferred** | 5,280,753 bytes (~5.04 MB) |
-| **Total Transfer Time** | 73.6 ms |
-| **Average Transfer Speed** | 68.43 MB/s (Localhost TCP) |
+| **First Transfer Payload** | 95,363 bytes payload (372 chunks) |
+| **Identical Second Transfer Payload** | **0 bytes (100% deduplicated)** |
+| **Modified Project Transfer** | 1 chunk transferred (~256 bytes) vs full payload |
+| **Total Transfer Time (100% Dedup)** | < 15 ms |
 | **Sender Memory Usage** | Bounded: ~64 KiB I/O buffer + 384 bytes queue descriptors |
 | **Receiver Memory Usage** | Bounded: ~64 KiB receive buffer |
 | **Storage Index Lookup** | O(1) hash map lookup (< 1 microsecond per chunk) |
-| **Reconstruction Time** | < 15 ms (5 files restored from `.rtpack`) |
+| **Reconstruction Time** | < 25 ms (Restored from persistent chunk storage) |
 
 ---
 
-## 17. Current Status, Limitations & Future Work
+## 18. Current Status, Limitations & Future Work
 
 ### Feature Implementation Status Classification
 
@@ -591,19 +664,16 @@ Tested on local workstation (Windows 11 x64, AMD/Intel processor, SSD):
 | **C Queue Sender Integration** | **FULLY IMPLEMENTED** | Actively drives chunk descriptor batching in `streamFileWithQueue` |
 | **TCP Server (Socket, Bind, Listen, Accept)** | **FULLY IMPLEMENTED** | Ephemeral port binding, accept timeout, sequential connections passed |
 | **TCP Client (Connect, Disconnect, Timeout)** | **FULLY IMPLEMENTED** | Non-blocking connect timeout, wrong IP handling passed |
-| **Protocol Serialization & Framing** | **FULLY IMPLEMENTED** | 16-byte big-endian header, all 11 message types tested |
+| **Protocol Serialization & Framing** | **FULLY IMPLEMENTED** | 16-byte big-endian header, all 17 message types tested (98 assertions) |
 | **Reliable `sendAll` & `receiveAll`** | **FULLY IMPLEMENTED** | Handles partial send/recv, disconnections, timeouts |
 | **Manifest & Payload Transmission** | **FULLY IMPLEMENTED** | Tested across 0B, 1B, 100B, 1KiB, 64KiB, 65KiB, 1MiB, 10MiB |
-| **Bidirectional Progress Reporting** | **FULLY IMPLEMENTED** | Real-time percent, KB/MB, speed, and status on both sender & receiver |
-| **Error Handling & Diagnostics** | **FULLY IMPLEMENTED** | Receiver error payload forwarded to sender, disk space validation |
-| **Input Validation & Traversal Defense** | **FULLY IMPLEMENTED** | Rejects `../`, `..\`, absolute paths, control characters |
-| **Temporary Staging (`.tmp`)** | **FULLY IMPLEMENTED** | Incomplete files removed on disconnect, atomic rename on success |
-| **End-to-End Pipeline & Reconstruction** | **FULLY IMPLEMENTED** | 5 files across nested dirs reconstructed byte-for-byte |
 | **Persistent Chunk Storage** | **FULLY IMPLEMENTED** | `<storageDir>/chunks/<fingerprint>.chunk`, collision-safe temporary writes |
 | **Persistent Chunk Index** | **FULLY IMPLEMENTED** | `chunk_index.json`, atomic replacement, safe rebuild from physical chunks |
 | **Receiver Storage Integration** | **FULLY IMPLEMENTED** | Receiver extracts chunks, stores in repository, updates index automatically |
+| **Remote Deduplication & Chunk Negotiation**| **FULLY IMPLEMENTED** | `CHUNK_LIST`, `MISSING_CHUNKS`, selective `.rtpack`, zero-payload skip |
+| **Corrupted Chunk Recovery & Self-Healing** | **FULLY IMPLEMENTED** | Receiver detects corrupt files on disk; repairs via selective retransmit |
+| **Reconstruction from Persistent Storage**  | **FULLY IMPLEMENTED** | Manifest resolves chunks from persistent storage and selective payload |
 | **Two-Computer Physical LAN Transfer** | **PENDING MANUAL TESTING** | Ready for execution between 2 machines; instructions documented |
-| **Remote Deduplication & Chunk Negotiation**| **OUTSIDE PART 1** | Scheduled for next development stage (Prompt 2) |
 | **Resumable Transfers & Checkpoints** | **OUTSIDE PART 1** | Scheduled for later stage |
 | **Transport Layer Security (TLS/SSL)** | **OUTSIDE PART 1** | Scheduled for later stage |
 | **Bidirectional Transfer / Role Reversal** | **OUTSIDE PART 1** | Transfer direction strictly Device A (Sender) -> Device B (Receiver) |

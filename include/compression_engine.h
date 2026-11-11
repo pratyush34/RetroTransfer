@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 struct CompressedChunkInfo {
     ChunkMetadata metadata;
@@ -44,6 +45,27 @@ public:
                                const std::string& payloadPath,
                                CompressionResult& result,
                                std::string& error) const;
+
+    /*
+     * Compress only the chunks requested by missingFingerprints.
+     * Reuses existing Huffman compression and raw-data fallback.
+     */
+    bool compressSelectedMissingChunks(const ProjectChunkResult& current,
+                                       const std::unordered_set<std::string>& missingFingerprints,
+                                       const std::string& payloadPath,
+                                       CompressionResult& result,
+                                       std::string& error) const;
+
+    /*
+     * Create a selective .rtpack payload from an existing manifest and/or existing payload,
+     * packaging only the specified missing chunk fingerprints.
+     */
+    bool createSelectivePayloadFromExisting(const std::string& sourceManifestPath,
+                                            const std::string& sourcePayloadPath,
+                                            const std::unordered_set<std::string>& missingFingerprints,
+                                            const std::string& outPayloadPath,
+                                            CompressionResult& result,
+                                            std::string& error) const;
 };
 
 #endif
