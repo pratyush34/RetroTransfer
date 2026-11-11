@@ -3,6 +3,7 @@
 #include "chunk_engine.h"
 #include "fingerprint_c.h"
 #include "huffman_codec_c.h"
+#include "storage/chunk_storage.h"
 
 #include <algorithm>
 #include <cctype>
@@ -511,7 +512,8 @@ bool ReconstructionEngine::reconstruct(const std::string& manifestPath,
                                        const std::string& payloadPath,
                                        const std::string& outputDirectory,
                                        ReconstructionResult& result,
-                                       std::string& error) const {
+                                       std::string& error,
+                                       const std::string& persistentStorageDir) const {
     result = {};
     error.clear();
 
@@ -720,23 +722,37 @@ bool ReconstructionEngine::reconstruct(const std::string& manifestPath,
                     }
                     ++writtenChunkCount;
                 } else {
-                    const auto source = availableChunks.find(key);
-                    if (source == availableChunks.end() ||
-                        source->second.crc32 != recipe.crc32) {
-                        throw std::runtime_error(
-                            "Missing chunk is neither in the payload nor in the destination: " +
-                            recipe.fingerprint);
+                    bool retrievedFromPersistent = false;
+                    if (!persistentStorageDir.empty()) {
+                        retro::storage::ChunkStorage pStorage(persistentStorageDir);
+                        std::string pErr;
+                        if (pStorage.retrieveChunk(recipe.fingerprint, bytes, pErr)) {
+                            if (bytes.size() == recipe.length &&
+                                rt_compute_crc32(bytes.data(), bytes.size()) == recipe.crc32) {
+                                ++reusableCount;
+                                retrievedFromPersistent = true;
+                            }
+                        }
                     }
-                    std::string readError;
-                    if (!readSourceChunk(source->second, bytes, readError)) {
-                        throw std::runtime_error(readError);
+                    if (!retrievedFromPersistent) {
+                        const auto source = availableChunks.find(key);
+                        if (source == availableChunks.end() ||
+                            source->second.crc32 != recipe.crc32) {
+                            throw std::runtime_error(
+                                "Missing chunk is neither in the payload, destination, nor persistent storage: " +
+                                recipe.fingerprint);
+                        }
+                        std::string readError;
+                        if (!readSourceChunk(source->second, bytes, readError)) {
+                            throw std::runtime_error(readError);
+                        }
+                        char fingerprint[33] = {};
+                        rt_compute_fingerprint_hex(bytes.data(), bytes.size(), 42, fingerprint);
+                        if (recipe.fingerprint != fingerprint) {
+                            throw std::runtime_error("Reusable chunk fingerprint verification failed.");
+                        }
+                        ++reusableCount;
                     }
-                    char fingerprint[33] = {};
-                    rt_compute_fingerprint_hex(bytes.data(), bytes.size(), 42, fingerprint);
-                    if (recipe.fingerprint != fingerprint) {
-                        throw std::runtime_error("Reusable chunk fingerprint verification failed.");
-                    }
-                    ++reusableCount;
                 }
                 if (bytes.size() != recipe.length ||
                     rt_compute_crc32(bytes.data(), bytes.size()) != recipe.crc32) {
@@ -854,3 +870,93 @@ bool ReconstructionEngine::reconstruct(const std::string& manifestPath,
         return false;
     }
 }
+
+bool ReconstructionEngine::extractPayloadChunks(const std::string& manifestPath,
+                                                const std::string& payloadPath,
+                                                std::vector<ExtractedChunk>& outChunks,
+                                                std::string& error) {
+    outChunks.clear();
+    error.clear();
+
+    try {
+        std::string manifestText;
+        if (!readFileBytes(manifestPath, manifestText, error)) return false;
+        const JsonValue manifest = JsonParser(manifestText).parse();
+
+        const auto selectiveIt = manifest.object.find("selectiveCompression");
+        if (selectiveIt == manifest.object.end() || selectiveIt->second.type != JsonValue::Type::Object) {
+            return true;
+        }
+        const JsonValue& compression = selectiveIt->second;
+        const auto payloadChunksIt = compression.object.find("payloadChunks");
+        if (payloadChunksIt == compression.object.end() || payloadChunksIt->second.type != JsonValue::Type::Array) {
+            return true;
+        }
+
+        fs::path bundlePath;
+        if (!payloadPath.empty()) {
+            bundlePath = payloadPath;
+        } else {
+            const std::string payloadName = requiredString(compression, "payloadFile");
+            bundlePath = fs::path(manifestPath).parent_path() / payloadName;
+        }
+
+        std::error_code ec;
+        const uintmax_t bundleSize = fs::file_size(bundlePath, ec);
+        if (ec || bundleSize < 8) {
+            error = "Could not read valid RTPK payload bundle: " + bundlePath.string();
+            return false;
+        }
+
+        std::ifstream payload(bundlePath, std::ios::binary);
+        char header[8] = {};
+        payload.read(header, sizeof(header));
+        if (!payload || std::string(header, header + 4) != "RTPK" ||
+            static_cast<unsigned char>(header[4]) != 1 ||
+            header[5] != 0 || header[6] != 0 || header[7] != 0) {
+            error = "Payload bundle has an invalid or unsupported RTPK header.";
+            return false;
+        }
+
+        for (const JsonValue& entry : payloadChunksIt->second.array) {
+            PayloadChunk chunk;
+            chunk.fingerprint = requiredString(entry, "fingerprint");
+            chunk.originalSize = requiredUnsigned(entry, "originalSize");
+            chunk.offset = requiredUnsigned(entry, "payloadOffset");
+            chunk.storedSize = requiredUnsigned(entry, "storedSize");
+            chunk.crc32 = parseCrc32(entry, "crc32");
+            chunk.codec = requiredString(entry, "codec");
+
+            if (!parseFingerprint(chunk.fingerprint) ||
+                (chunk.codec != "raw" && chunk.codec != "huffman")) {
+                error = "Manifest contains invalid payload chunk metadata.";
+                return false;
+            }
+
+            if (chunk.offset < 8 || chunk.offset > bundleSize ||
+                chunk.storedSize > bundleSize - chunk.offset) {
+                error = "Payload chunk points outside the bundle file.";
+                return false;
+            }
+
+            std::vector<uint8_t> decodedBytes;
+            if (!readStoredChunk(payload, chunk, decodedBytes, error)) {
+                return false;
+            }
+
+            ExtractedChunk ext;
+            ext.fingerprint = chunk.fingerprint;
+            ext.originalSize = chunk.originalSize;
+            ext.crc32 = chunk.crc32;
+            ext.codec = chunk.codec;
+            ext.data = std::move(decodedBytes);
+            outChunks.push_back(std::move(ext));
+        }
+
+        return true;
+    } catch (const std::exception& ex) {
+        error = ex.what();
+        return false;
+    }
+}
+

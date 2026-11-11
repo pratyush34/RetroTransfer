@@ -82,6 +82,8 @@ static void test_file_sizes_transfer(size_t fileSize, const std::string& testNam
     ReceiverConfig rConfig;
     rConfig.port = 0; // ephemeral port
     rConfig.baseStorageDir = (tempDir / "received").string();
+    rConfig.chunkStorageDir = (tempDir / "storage").string();
+    rConfig.enableChunkStorage = false;
     rConfig.interactive = false;
     rConfig.verbose = false;
     rConfig.acceptTimeoutMs = 5000;
@@ -285,6 +287,8 @@ static void test_end_to_end_pipeline_and_reconstruction() {
     rCfg.port = transferPort;
     rCfg.baseStorageDir = receivedDir.string();
     rCfg.autoReconstructDir = reconstructedDir.string();
+    rCfg.chunkStorageDir = (rootTestDir / "storage").string();
+    rCfg.enableChunkStorage = true;
     rCfg.interactive = false;
     rCfg.verbose = false;
     rCfg.acceptTimeoutMs = 8000;
@@ -342,6 +346,11 @@ static void test_end_to_end_pipeline_and_reconstruction() {
     TEST_ASSERT(fs::exists(reconstructedDir / "README.txt"), "Reconstructed README.txt exists");
     TEST_ASSERT(filesEqual(originalProjectDir / "README.txt",
                            reconstructedDir / "README.txt"), "README.txt matches byte-for-byte");
+
+    // 8. Verify Persistent Storage Integration on Receiver
+    TEST_ASSERT(fs::exists(rootTestDir / "storage" / "chunk_index.json"), "Persistent chunk_index.json was created");
+    TEST_ASSERT(fs::exists(rootTestDir / "storage" / "storage_config.json"), "storage_config.json was created");
+    TEST_ASSERT(fs::exists(rootTestDir / "storage" / "chunks"), "storage/chunks directory was created");
 
     std::cout << "[SUCCESS] Entire project reconstructed and verified byte-for-byte!\n";
 

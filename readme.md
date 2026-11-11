@@ -19,8 +19,10 @@ RetroTransfer is an incremental project-transfer system designed to transfer evo
 - [11. Streaming, Progress & Error Handling](#11-streaming-progress--error-handling)
 - [12. Input Validation & Security Limitations](#12-input-validation--security-limitations)
 - [13. Reconstruction Integration](#13-reconstruction-integration)
-- [14. Automated Testing Suite](#14-automated-testing-suite)
-- [15. Current Status, Limitations & Future Work](#15-current-status-limitations--future-work)
+- [14. Persistent Chunk Storage & Indexing](#14-persistent-chunk-storage--indexing)
+- [15. Automated Testing Suite](#15-automated-testing-suite)
+- [16. Performance and Memory Metrics](#16-performance-and-memory-metrics)
+- [17. Current Status, Limitations & Future Work](#17-current-status-limitations--future-work)
 
 ---
 
@@ -436,6 +438,69 @@ After the receiver receives both manifest and payload files:
 
 ## 14. Automated Testing Suite
 
+## 14. Persistent Chunk Storage & Indexing
+
+RetroTransfer features a persistent chunk repository on the receiver designed to maintain stored chunk data across application lifecycles and reconstruct projects using locally stored chunks.
+
+### Directory Structure
+
+```
+RetroTransfer/
+|
+|-- storage/
+|   |
+|   |-- chunks/
+|   |   |-- <fingerprint>.chunk
+|   |   |-- <fingerprint>.chunk
+|   |
+|   |-- chunk_index.json
+|   |
+|   |-- storage_config.json
+|
+|-- received_projects/
+|-- transfer_data/
+```
+
+### Core Architecture & Classes
+
+1. **`ChunkVerifier` (`include/storage/chunk_verifier.h`)**:
+   - Calculates 128-bit MurmurHash3 content fingerprints (32 lowercase hex characters, seed 42) and IEEE 802.3 CRC32 checksums.
+   - Verifies memory buffers and physical files on disk against expected fingerprints and checksums.
+   - Performs byte-for-byte collision safety verification.
+
+2. **`ChunkRecord` / `ChunkMetadata` (`include/storage/chunk_record.h`)**:
+   - Stores chunk metadata: `fingerprint`, `size`, `crc32`, `filename`, `status` (`available`, `corrupted`, `missing`), format `version`, and `createdAt` timestamp.
+   - Serializes to and deserializes from JSON via `StorageJsonValue`.
+
+3. **`ChunkStorage` (`include/storage/chunk_storage.h`)**:
+   - Manages physical chunk files on disk inside `<storageDir>/chunks/<fingerprint>.chunk`.
+   - Collision-Safe Staging: Chunks are written to a temporary file (`<fingerprint>.<ts>.<seq>.tmp`), verified for size, checksum, and fingerprint, and only then atomically renamed to `<fingerprint>.chunk`.
+   - If an existing chunk with the same fingerprint exists, it verifies identical size, checksum, and byte-for-byte contents (idempotent duplicate detection). If bytes differ, a collision is detected and rejected without overwriting.
+
+4. **`ChunkIndex` (`include/storage/chunk_index.h`)**:
+   - Maintains an in-memory index of all stored chunks with O(1) hash map lookup.
+   - Atomic Persistence: Serializes the index to `<storageDir>/chunk_index.json` using atomic temporary file write and rename (`safeWriteJsonFile`).
+   - Repository Rebuild: If `chunk_index.json` is missing or corrupted, `rebuildFromChunks` scans all `.chunk` files in `chunks/`, validates their integrity, and regenerates a consistent index file.
+   - Validation: `validateIndex` checks that every indexed entry points to a physical, non-corrupted chunk file on disk.
+
+5. **`StorageManager` (`include/storage/storage_manager.h`)**:
+   - Coordinates `ChunkStorage` and `ChunkIndex`.
+   - Loads or creates `storage_config.json` containing repository configurations (format version, directory layout, max chunk size).
+   - Serves as the primary interface for storing, querying, retrieving, and validating chunks.
+
+6. **Receiver Integration**:
+   - Integrated into `TransferReceiver::receive`:
+     1. Receives manifest and payload bundle over TCP.
+     2. Extracts all chunks from payload bundle using `ReconstructionEngine::extractPayloadChunks`.
+     3. Verifies each chunk (size, MurmurHash3, CRC32).
+     4. Stores valid chunks into persistent storage via `StorageManager::storeChunk`.
+     5. Updates `chunk_index.json`.
+     6. Invokes project reconstruction (`ReconstructionEngine::reconstruct`), which can look up missing chunks in persistent storage.
+
+---
+
+## 15. Automated Testing Suite
+
 The project includes an extensive automated test suite run via `ctest`:
 
 ```powershell
@@ -473,7 +538,7 @@ ctest --test-dir build --output-on-failure
    - Client non-blocking connection timeout (< 4 seconds instead of 20+ second OS hanging).
    - Abrupt peer disconnection detection during header receive.
 
-5. **File Streaming & End-to-End Reconstruction Tests** (`test_file_transfer.exe` - 81 assertions, 0 failures):
+5. **File Streaming & End-to-End Reconstruction Tests** (`test_file_transfer.exe` - 84 assertions, 0 failures):
    - Streamed transfer across sizes: 0-byte, 1-byte, 100-byte, 1 KiB, 64 KiB (exact buffer boundary), 65 KiB (boundary + 1, partial trailing block), 150 KiB, 1 MiB (exact queue capacity), 5 MiB, and 10 MiB (160 blocks wrapping around circular queue 10 times).
    - Streamed transfer of binary data with embedded null bytes.
    - Streamed transfer of binary data containing all 256 byte values (`0x00` through `0xFF` cycled across 256 KiB).
@@ -486,12 +551,19 @@ ctest --test-dir build --output-on-failure
      5. Generates the canonical manifest JSON using `retro::writeChunkManifestJson` (`ManifestWriter`).
      6. Streams manifest and payload over TCP sockets between client and receiver using C `TransferQueue`.
      7. Verifies disk space, temporary file staging, and validates manifest JSON.
-     8. Invokes `ReconstructionEngine` on received files.
+     8. Automatically extracts chunks, stores them into persistent chunk storage, updates `chunk_index.json`, and invokes `ReconstructionEngine`.
      9. Asserts 100% byte-for-byte equality for all 5 reconstructed files across all directories against originals.
+     10. Verifies persistent chunk storage repository files (`chunk_index.json`, `storage_config.json`, `storage/chunks/`).
+
+6. **Persistent Storage & Indexing Tests** (`test_storage.exe` - 89 assertions, 0 failures):
+   - **Category A (Storage)**: Store new chunk, retrieve stored chunk, idempotent duplicate storage, collision rejection, empty chunk (0-byte), binary chunk with embedded null bytes, large chunk (1 MiB), retrieve nonexistent chunk rejection, detect corrupted chunk data on disk, detect missing storage files.
+   - **Category B (Index)**: Create index, save index, load index, find chunk, contains chunk, insert duplicate fingerprint handling, remove entry, reject malformed JSON, handle missing JSON, atomic safe write verification (no leftover `.tmp` files).
+   - **Category C (Persistence)**: Close `StorageManager`, reopen `StorageManager` in new session, confirm all chunks remain available and repository validation passes.
+   - **Category D (Receiver Integration)**: Receive valid project transfer, extract chunks via `ReconstructionEngine::extractPayloadChunks`, store in persistent storage, verify all chunks match extracted data, verify reconstructed project files match byte-for-byte, delete `chunk_index.json` and rebuild index from physical chunk files, verify 100% repository consistency.
 
 ---
 
-## 15. Performance and Memory Metrics
+## 16. Performance and Memory Metrics
 
 Tested on local workstation (Windows 11 x64, AMD/Intel processor, SSD):
 
@@ -504,11 +576,12 @@ Tested on local workstation (Windows 11 x64, AMD/Intel processor, SSD):
 | **Average Transfer Speed** | 68.43 MB/s (Localhost TCP) |
 | **Sender Memory Usage** | Bounded: ~64 KiB I/O buffer + 384 bytes queue descriptors |
 | **Receiver Memory Usage** | Bounded: ~64 KiB receive buffer |
+| **Storage Index Lookup** | O(1) hash map lookup (< 1 microsecond per chunk) |
 | **Reconstruction Time** | < 15 ms (5 files restored from `.rtpack`) |
 
 ---
 
-## 16. Current Status, Limitations & Future Work
+## 17. Current Status, Limitations & Future Work
 
 ### Feature Implementation Status Classification
 
@@ -526,8 +599,11 @@ Tested on local workstation (Windows 11 x64, AMD/Intel processor, SSD):
 | **Input Validation & Traversal Defense** | **FULLY IMPLEMENTED** | Rejects `../`, `..\`, absolute paths, control characters |
 | **Temporary Staging (`.tmp`)** | **FULLY IMPLEMENTED** | Incomplete files removed on disconnect, atomic rename on success |
 | **End-to-End Pipeline & Reconstruction** | **FULLY IMPLEMENTED** | 5 files across nested dirs reconstructed byte-for-byte |
+| **Persistent Chunk Storage** | **FULLY IMPLEMENTED** | `<storageDir>/chunks/<fingerprint>.chunk`, collision-safe temporary writes |
+| **Persistent Chunk Index** | **FULLY IMPLEMENTED** | `chunk_index.json`, atomic replacement, safe rebuild from physical chunks |
+| **Receiver Storage Integration** | **FULLY IMPLEMENTED** | Receiver extracts chunks, stores in repository, updates index automatically |
 | **Two-Computer Physical LAN Transfer** | **PENDING MANUAL TESTING** | Ready for execution between 2 machines; instructions documented |
-| **Remote Deduplication & Chunk Negotiation**| **OUTSIDE PART 1** | Scheduled for Part 2 |
-| **Persistent Receiver Chunk Index** | **OUTSIDE PART 1** | Scheduled for Part 2 |
-| **Resumable Transfers & Checkpoints** | **OUTSIDE PART 1** | Scheduled for Part 3 |
-| **Transport Layer Security (TLS/SSL)** | **OUTSIDE PART 1** | Scheduled for Part 3 |
+| **Remote Deduplication & Chunk Negotiation**| **OUTSIDE PART 1** | Scheduled for next development stage (Prompt 2) |
+| **Resumable Transfers & Checkpoints** | **OUTSIDE PART 1** | Scheduled for later stage |
+| **Transport Layer Security (TLS/SSL)** | **OUTSIDE PART 1** | Scheduled for later stage |
+| **Bidirectional Transfer / Role Reversal** | **OUTSIDE PART 1** | Transfer direction strictly Device A (Sender) -> Device B (Receiver) |

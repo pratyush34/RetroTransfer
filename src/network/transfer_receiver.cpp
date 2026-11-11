@@ -1,4 +1,5 @@
 #include "network/transfer_receiver.h"
+#include "storage/storage_manager.h"
 
 #include <filesystem>
 #include <fstream>
@@ -420,7 +421,45 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
         std::cout << "============================================================\n";
     }
 
-    // 6. Reconstruction Integration
+    // 6. Persistent Chunk Storage and Indexing Integration
+    if (config.enableChunkStorage) {
+        if (config.verbose) {
+            std::cout << "[Receiver] Persisting received chunks into storage (" << config.chunkStorageDir << ")...\n";
+        }
+        retro::storage::StorageManager storageMgr(config.chunkStorageDir);
+        std::string sErr;
+        if (!storageMgr.initialize(sErr)) {
+            if (config.verbose) {
+                std::cerr << "[Receiver] Warning: StorageManager initialization failed: " << sErr << "\n";
+            }
+        } else {
+            std::vector<ExtractedChunk> extractedChunks;
+            std::string extractErr;
+            if (ReconstructionEngine::extractPayloadChunks(
+                    outFiles.manifestPath, outFiles.payloadPath, extractedChunks, extractErr)) {
+                size_t storedCount = 0;
+                size_t existingCount = 0;
+                for (const auto& chk : extractedChunks) {
+                    if (storageMgr.hasChunk(chk.fingerprint)) {
+                        existingCount++;
+                    }
+                    std::string storeErr;
+                    if (storageMgr.storeChunk(chk.fingerprint, chk.data.data(), chk.data.size(), chk.crc32, storeErr)) {
+                        storedCount++;
+                    } else if (config.verbose) {
+                        std::cerr << "[Receiver] Warning: Failed to store chunk " << chk.fingerprint << ": " << storeErr << "\n";
+                    }
+                }
+                if (config.verbose && !extractedChunks.empty()) {
+                    std::cout << "[Receiver] Persistent Storage: " << extractedChunks.size() << " chunks processed ("
+                              << existingCount << " existing, " << (storedCount - existingCount) << " newly added). Total indexed: "
+                              << storageMgr.getStoredChunkCount() << " chunks.\n";
+                }
+            }
+        }
+    }
+
+    // 7. Reconstruction Integration
     std::string destinationDir = config.autoReconstructDir;
 
     if (destinationDir.empty() && config.interactive) {
@@ -436,7 +475,8 @@ bool TransferReceiver::receive(const ReceiverConfig& config, ReceivedFiles& outF
         std::cout << "\n[Reconstruction] Starting project reconstruction into: " << destinationDir << "...\n";
         ReconstructionResult recResult;
         std::string recError;
-        if (!reconstructProject(outFiles.manifestPath, outFiles.payloadPath, destinationDir, recResult, recError)) {
+        if (!reconstructProject(outFiles.manifestPath, outFiles.payloadPath, destinationDir, recResult, recError,
+                                config.enableChunkStorage ? config.chunkStorageDir : "")) {
             std::cerr << "Error: Reconstruction failed: " << recError << "\n";
         } else {
             std::cout << "Reconstructed files: " << recResult.filesWritten << "\n";
@@ -453,9 +493,10 @@ bool TransferReceiver::reconstructProject(const std::string& manifestPath,
                                           const std::string& payloadPath,
                                           const std::string& destinationDir,
                                           ReconstructionResult& result,
-                                          std::string& error) {
+                                          std::string& error,
+                                          const std::string& chunkStorageDir) {
     ReconstructionEngine engine;
-    return engine.reconstruct(manifestPath, payloadPath, destinationDir, result, error);
+    return engine.reconstruct(manifestPath, payloadPath, destinationDir, result, error, chunkStorageDir);
 }
 
 } // namespace retro::net

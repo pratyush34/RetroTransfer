@@ -19,6 +19,15 @@ endif()
 
 include_directories(include)
 
+set(RETRO_STORAGE_SOURCES
+    src/storage/json_helper.cpp
+    src/storage/chunk_record.cpp
+    src/storage/chunk_verifier.cpp
+    src/storage/chunk_storage.cpp
+    src/storage/chunk_index.cpp
+    src/storage/storage_manager.cpp
+)
+
 set(RETRO_CORE_SOURCES
     src/scanner.cpp
     src/fingerprint.c
@@ -31,6 +40,7 @@ set(RETRO_CORE_SOURCES
     src/adaptive_policy.cpp
     src/chunk_engine.cpp
     src/manifest_writer.cpp
+    ${RETRO_STORAGE_SOURCES}
 )
 
 set(RETRO_NETWORK_SOURCES
@@ -97,3 +107,12 @@ add_executable(test_file_transfer
 )
 target_link_libraries(test_file_transfer PRIVATE ${NETWORK_LIBS})
 add_test(NAME FileTransferAndE2ETests COMMAND test_file_transfer)
+
+# 5. Persistent Storage & Indexing Tests
+add_executable(test_storage
+    tests/test_storage.cpp
+    ${RETRO_CORE_SOURCES}
+    ${RETRO_NETWORK_SOURCES}
+)
+target_link_libraries(test_storage PRIVATE ${NETWORK_LIBS})
+add_test(NAME StorageTests COMMAND test_storage)

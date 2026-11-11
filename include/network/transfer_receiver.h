@@ -17,6 +17,8 @@ struct ReceiverConfig {
     bool interactive = true;         // If true, prompts user before reconstruction
     bool verbose = true;
     int acceptTimeoutMs = 0;        // 0 = block indefinitely until sender connects
+    std::string chunkStorageDir = "storage"; // Directory for persistent chunk storage
+    bool enableChunkStorage = true;          // Enable persisting and indexing received chunks
 };
 
 struct ReceivedFiles {
@@ -44,7 +46,8 @@ public:
                             const std::string& payloadPath,
                             const std::string& destinationDir,
                             ReconstructionResult& result,
-                            std::string& error);
+                            std::string& error,
+                            const std::string& chunkStorageDir = "");
 
     /*
      * Stop the server if listening.
