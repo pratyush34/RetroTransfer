@@ -340,12 +340,24 @@ static int handleSendCommand(int argc, char* argv[]) {
                 std::cerr << "Error: Invalid port number: " << argv[i] << "\n";
                 return 2;
             }
-        } else if (arg == "--timeout") {
+                } else if (arg == "--timeout") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --timeout requires milliseconds value.\n";
                 return 2;
             }
             config.connectionTimeoutMs = std::stoi(argv[++i]);
+        } else if (arg == "--benchmark-csv") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --benchmark-csv requires a file path.\n";
+                return 2;
+            }
+            config.benchmarkCSVPath = argv[++i];
+        } else if (arg == "--benchmark-json") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --benchmark-json requires a file path.\n";
+                return 2;
+            }
+            config.benchmarkJSONPath = argv[++i];
         } else {
             std::cerr << "Error: Unrecognized send option: " << arg << "\n";
             return 2;
@@ -380,7 +392,7 @@ static int handleReceiveCommand(int argc, char* argv[]) {
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: RetroTransfer receive [--port <port>] [--output <directory>] [--auto-reconstruct] [--base-dir <dir>]\n";
+            std::cout << "Usage: RetroTransfer send --manifest <manifest.json> --payload <payload.rtpack> --ip <receiver_ip> [--port <port>] [--timeout <ms>] [--benchmark-csv <file>] [--benchmark-json <file>]\n";
             return 0;
         } else if (arg == "--port") {
             if (i + 1 >= argc) {

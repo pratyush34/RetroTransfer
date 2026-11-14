@@ -15,6 +15,8 @@ struct SenderConfig {
     std::string payloadPath;
     std::string projectDir;          // Optional project directory for direct chunk access
     std::string receiverIp;
+    std::string benchmarkCSVPath;
+    std::string benchmarkJSONPath;
     uint16_t receiverPort = 8080;
     int connectionTimeoutMs = 10000;
     bool verbose = true;

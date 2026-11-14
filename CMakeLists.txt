@@ -30,6 +30,7 @@ set(RETRO_STORAGE_SOURCES
 
 set(RETRO_CORE_SOURCES
     src/scanner.cpp
+    src/benchmark/benchmark_reporter.cpp
     src/fingerprint.c
     src/huffman_codec.c
     src/compression_engine.c
@@ -125,3 +126,10 @@ add_executable(test_remote_dedup
 )
 target_link_libraries(test_remote_dedup PRIVATE ${NETWORK_LIBS})
 add_test(NAME RemoteDedupTests COMMAND test_remote_dedup)
+# 7. Benchmark Reporting Tests
+add_executable(test_benchmark
+    tests/test_benchmark.cpp
+    src/benchmark/benchmark_reporter.cpp
+)
+
+add_test(NAME BenchmarkTests COMMAND test_benchmark)
