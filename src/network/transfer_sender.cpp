@@ -1,7 +1,7 @@
 #include "network/transfer_sender.h"
 #include "compression_engine.h"
 #include "storage/json_helper.h"
-
+#include "benchmark/benchmark_reporter.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -363,7 +363,6 @@ bool TransferSender::send(const SenderConfig& config, std::string& error) {
         error = "Manifest file does not exist or is not a regular file: " + config.manifestPath;
         return false;
     }
-
     // 2. Validate manifest JSON
     if (!validateJsonFile(config.manifestPath, error)) {
         return false;
@@ -670,6 +669,62 @@ bool TransferSender::send(const SenderConfig& config, std::string& error) {
         error = "Expected COMPLETE_ACK, received " + messageTypeToString(static_cast<MessageType>(ackHdr.type));
         return false;
     }
+
+    // Export benchmark results only after the transfer has completed successfully.
+    if (!config.benchmarkCSVPath.empty() ||
+        !config.benchmarkJSONPath.empty()) {
+
+        retro::benchmark::BenchmarkReporter reporter;
+        retro::benchmark::BenchmarkResult result;
+        result.scenario = "Network Transfer";
+
+        const auto timestamp = std::chrono::system_clock::now()
+            .time_since_epoch();
+        result.timestamp = std::to_string(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                timestamp
+            ).count()
+        );
+
+        result.originalBytes = stats_.totalOriginalBytes;
+        // Includes the manifest and payload bytes sent over the connection.
+        result.transmittedBytes = stats_.actualTransmittedBytes;
+        result.deduplicatedBytes = stats_.deduplicatedBytes;
+        result.compressionSavingsBytes = stats_.compressionSavingsBytes;
+        result.transferTimeMs = stats_.totalTransferTimeMs;
+        result.totalChunks = stats_.totalProjectChunks;
+        result.transferredChunks = stats_.transferredChunks;
+
+        reporter.addResult(result);
+
+        bool reportsSucceeded = true;
+        std::string reportError;
+
+        if (!config.benchmarkCSVPath.empty()) {
+            reportError.clear();
+            if (!reporter.exportCSV(config.benchmarkCSVPath, reportError)) {
+                reportsSucceeded = false;
+                std::cerr << "[Benchmark] CSV export failed: "
+                          << reportError << "\n";
+            }
+        }
+
+        if (!config.benchmarkJSONPath.empty()) {
+            reportError.clear();
+            if (!reporter.exportJSON(config.benchmarkJSONPath, reportError)) {
+                reportsSucceeded = false;
+                std::cerr << "[Benchmark] JSON export failed: "
+                          << reportError << "\n";
+            }
+        }
+
+        if (reportsSucceeded) {
+            std::cout << "[Benchmark] Reports generated.\n";
+        } else {
+            std::cerr << "[Benchmark] One or more reports could not be generated.\n";
+        }
+    }
+
 
     if (config.verbose) {
         std::cout << "[Sender] Transfer completed successfully!\n";
