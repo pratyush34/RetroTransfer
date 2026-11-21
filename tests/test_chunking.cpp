@@ -123,6 +123,12 @@ static fs::path createTestFileText(const std::string& name, const std::string& c
     return createTestFile(name, data);
 }
 
+#include "test_scanner_coverage.hpp"
+#include "test_chunking_edge_cases.hpp"
+#include "test_integrity_fingerprint.hpp"
+#include "test_compression_dedup.hpp"
+#include "test_reconstruction_comprehensive.hpp"
+
 // 1. Empty file
 static void test_empty_file() {
     fs::path p = createTestFile("empty.bin", {});
@@ -954,6 +960,61 @@ int main() {
     RUN_TEST(test_selective_codec_compression);
     RUN_TEST(test_selective_compression_deduplicates_current_chunks);
     RUN_TEST(test_reconstruction_uses_payload_and_existing_chunks);
+
+    // ==========================================
+    // EXTENDED TEST SUITE: SCANNER COVERAGE
+    // ==========================================
+    RUN_TEST(test_scanner_empty_directory);
+    RUN_TEST(test_scanner_single_and_multiple_files);
+    RUN_TEST(test_scanner_nested_directories);
+    RUN_TEST(test_scanner_ignored_folders_pruning);
+    RUN_TEST(test_scanner_ignored_extensions_pruning);
+    RUN_TEST(test_scanner_nonexistent_directory);
+
+    // ==========================================
+    // EXTENDED TEST SUITE: CHUNKING EDGE CASES
+    // ==========================================
+    RUN_TEST(test_cdc_empty_file_edge);
+    RUN_TEST(test_cdc_one_byte_file_edge);
+    RUN_TEST(test_cdc_smaller_than_min_chunk_edge);
+    RUN_TEST(test_cdc_repetitive_pattern_edge);
+    RUN_TEST(test_fixed_chunker_odd_sizes);
+    RUN_TEST(test_chunk_engine_process_file_direct);
+    RUN_TEST(test_read_chunk_payload_bounds);
+
+    // ==========================================
+    // EXTENDED TEST SUITE: INTEGRITY & FINGERPRINT
+    // ==========================================
+    RUN_TEST(test_crc32_empty_buffer);
+    RUN_TEST(test_crc32_standard_vectors_and_single_byte);
+    RUN_TEST(test_crc32_bit_flip_sensitivity);
+    RUN_TEST(test_murmurhash3_empty_and_seeds);
+    RUN_TEST(test_fingerprint_hex_format);
+    RUN_TEST(test_fingerprint_single_byte_mutation);
+
+    // ==========================================
+    // EXTENDED TEST SUITE: COMPRESSION & DEDUP
+    // ==========================================
+    RUN_TEST(test_huffman_empty_data);
+    RUN_TEST(test_huffman_single_symbol_repeated);
+    RUN_TEST(test_huffman_uniform_byte_distribution);
+    RUN_TEST(test_huffman_corrupted_stream);
+    RUN_TEST(test_compression_engine_all_chunks_reusable);
+    RUN_TEST(test_compression_engine_cross_file_duplicates);
+    RUN_TEST(test_compression_engine_incompressible_fallback);
+    RUN_TEST(test_compression_engine_empty_project);
+
+    // ==========================================
+    // EXTENDED TEST SUITE: RECONSTRUCTION COMPREHENSIVE
+    // ==========================================
+    RUN_TEST(test_reconstruction_corrupted_payload);
+    RUN_TEST(test_reconstruction_missing_payload);
+    RUN_TEST(test_reconstruction_invalid_manifest_json);
+    RUN_TEST(test_reconstruction_missing_manifest_fields);
+    RUN_TEST(test_reconstruction_path_traversal_rejected);
+    RUN_TEST(test_reconstruction_empty_file);
+    RUN_TEST(test_reconstruction_deeply_nested_directory);
+    RUN_TEST(test_reconstruction_chunk_store_integration);
 
     cleanupTestDir();
 
