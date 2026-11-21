@@ -391,125 +391,6 @@ bool readFileBytes(const fs::path& path, std::string& contents, std::string& err
     return true;
 }
 
-bool decodeRle(const std::vector<uint8_t>& stored, uint64_t originalSize,
-               std::vector<uint8_t>& decoded, std::string& error) {
-    if (stored.size() % 2 != 0 ||
-        originalSize > std::numeric_limits<size_t>::max()) {
-        error = "RLE payload has an invalid size.";
-        return false;
-    }
-    decoded.resize(static_cast<size_t>(originalSize));
-    size_t outputPosition = 0;
-    for (size_t index = 0; index < stored.size(); index += 2) {
-        const size_t runLength = stored[index];
-        if (runLength == 0 || runLength > decoded.size() - outputPosition) {
-            error = "RLE payload contains an invalid run.";
-            return false;
-        }
-        std::fill(decoded.begin() + static_cast<std::ptrdiff_t>(outputPosition),
-                  decoded.begin() + static_cast<std::ptrdiff_t>(outputPosition + runLength),
-                  stored[index + 1]);
-        outputPosition += runLength;
-    }
-    if (outputPosition != decoded.size()) {
-        error = "RLE payload does not match the original chunk size.";
-        return false;
-    }
-    return true;
-}
-
-bool decodeLzw(const std::vector<uint8_t>& stored, uint64_t originalSize,
-               std::vector<uint8_t>& decoded, std::string& error) {
-    constexpr uint32_t dictionaryLimit = 65536;
-    if (stored.empty() || stored.size() % 2 != 0 ||
-        originalSize == 0 ||
-        originalSize > std::numeric_limits<size_t>::max()) {
-        error = "LZW payload has an invalid size.";
-        return false;
-    }
-
-    std::vector<uint16_t> prefixes(dictionaryLimit);
-    std::vector<uint8_t> suffixes(dictionaryLimit);
-    std::vector<uint8_t> stack(dictionaryLimit);
-    decoded.clear();
-    decoded.reserve(static_cast<size_t>(originalSize));
-
-    const auto readCode = [&stored](size_t position) {
-        return static_cast<uint16_t>(
-            (static_cast<uint16_t>(stored[position]) << 8) |
-            static_cast<uint16_t>(stored[position + 1]));
-    };
-    const auto expand = [&](uint32_t code, uint32_t nextCode,
-                            size_t& stackSize) {
-        stackSize = 0;
-        while (code >= 256) {
-            if (code >= nextCode || stackSize >= stack.size()) return false;
-            stack[stackSize++] = suffixes[code];
-            code = prefixes[code];
-        }
-        if (stackSize >= stack.size()) return false;
-        stack[stackSize++] = static_cast<uint8_t>(code);
-        return true;
-    };
-
-    uint32_t previousCode = readCode(0);
-    if (previousCode >= 256) {
-        error = "LZW payload does not begin with a literal byte.";
-        return false;
-    }
-    decoded.push_back(static_cast<uint8_t>(previousCode));
-    uint8_t previousFirst = static_cast<uint8_t>(previousCode);
-    uint32_t nextCode = 256;
-
-    for (size_t position = 2; position < stored.size(); position += 2) {
-        const uint32_t code = readCode(position);
-        size_t stackSize = 0;
-        uint8_t first = 0;
-        if (code < nextCode) {
-            if (!expand(code, nextCode, stackSize)) {
-                error = "LZW payload contains an invalid dictionary code.";
-                return false;
-            }
-            first = stack[stackSize - 1];
-        } else if (code == nextCode && nextCode < dictionaryLimit) {
-            if (!expand(previousCode, nextCode, stackSize)) {
-                error = "LZW payload contains an invalid previous code.";
-                return false;
-            }
-            first = previousFirst;
-        } else {
-            error = "LZW payload contains an out-of-range dictionary code.";
-            return false;
-        }
-
-        const size_t extraByte = code == nextCode ? 1 : 0;
-        const size_t expectedSize = static_cast<size_t>(originalSize);
-        if (decoded.size() > expectedSize ||
-            stackSize + extraByte > expectedSize - decoded.size()) {
-            error = "LZW payload expands beyond the declared chunk size.";
-            return false;
-        }
-        for (size_t index = stackSize; index > 0; --index) {
-            decoded.push_back(stack[index - 1]);
-        }
-        if (extraByte != 0) decoded.push_back(first);
-
-        if (nextCode < dictionaryLimit) {
-            prefixes[nextCode] = static_cast<uint16_t>(previousCode);
-            suffixes[nextCode] = first;
-            ++nextCode;
-        }
-        previousCode = code;
-        previousFirst = first;
-    }
-
-    if (decoded.size() != originalSize) {
-        error = "LZW payload does not match the original chunk size.";
-        return false;
-    }
-    return true;
-}
-
 bool readStoredChunk(std::ifstream& payload, const PayloadChunk& chunk,
                      std::vector<uint8_t>& decoded, std::string& error) {
     if (chunk.originalSize > kMaxChunkSizeBytes ||
@@ -554,10 +435,6 @@ bool readStoredChunk(std::ifstream& payload, const PayloadChunk& chunk,
         }
         if (outputSize != 0) decoded.assign(output, output + outputSize);
         std::free(output);
-    } else if (chunk.codec == "rle") {
-        if (!decodeRle(stored, chunk.originalSize, decoded, error)) return false;
-    } else if (chunk.codec == "lzw") {
-        if (!decodeLzw(stored, chunk.originalSize, decoded, error)) return false;
     } else {
         error = "Manifest specifies an unsupported payload codec: " + chunk.codec;
         return false;
@@ -830,8 +707,7 @@ bool ReconstructionEngine::reconstruct(const std::string& manifestPath,
             chunk.crc32 = parseCrc32(entry, "crc32");
             chunk.codec = requiredString(entry, "codec");
             if (!parseFingerprint(chunk.fingerprint) ||
-                (chunk.codec != "raw" && chunk.codec != "huffman" &&
-                 chunk.codec != "rle" && chunk.codec != "lzw")) {
+                (chunk.codec != "raw" && chunk.codec != "huffman")) {
                 throw std::runtime_error("Manifest contains invalid payload chunk metadata.");
             }
             const std::string key =

@@ -38,6 +38,10 @@
 #include <QNetworkAddressEntry>
 #include <QRandomGenerator>
 #include <QStandardPaths>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QFile>
+#include <QLocale>
 
 #include <algorithm>
 
@@ -207,6 +211,20 @@ QToolButton *createNavButton(QWidget *parent, LineIcon icon,
 void addFieldIcon(QLineEdit *field, LineIcon icon)
 {
     field->addAction(lineIcon(icon), QLineEdit::LeadingPosition);
+}
+
+QString formatByteSize(quint64 bytes)
+{
+    if (bytes < 1024) {
+        return QString::number(bytes) + " B";
+    }
+    if (bytes < 1024ULL * 1024ULL) {
+        return QString("%1 KB").arg(bytes / 1024.0, 0, 'f', 2);
+    }
+    if (bytes < 1024ULL * 1024ULL * 1024ULL) {
+        return QString("%1 MB").arg(bytes / (1024.0 * 1024.0), 0, 'f', 2);
+    }
+    return QString("%1 GB").arg(bytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 2);
 }
 
 }
@@ -554,6 +572,20 @@ MainWindow::MainWindow(QWidget *parent)
     actionCardLayout->addWidget(progressBar);
     rightLayout->addWidget(actionCard);
 
+    QVBoxLayout *comparisonCardLayout = nullptr;
+    comparisonWidget = createCard("Size comparison", comparisonCardLayout);
+    originalSizeLabel = new QLabel("Original project: --");
+    payloadSizeLabel = new QLabel("Transfer package: --");
+    sizeSavedLabel = new QLabel("Size saved: --");
+    originalSizeLabel->setObjectName("muted");
+    payloadSizeLabel->setObjectName("muted");
+    sizeSavedLabel->setObjectName("statusLabel");
+    comparisonCardLayout->addWidget(originalSizeLabel);
+    comparisonCardLayout->addWidget(payloadSizeLabel);
+    comparisonCardLayout->addWidget(sizeSavedLabel);
+    comparisonWidget->setVisible(false);
+    rightLayout->addWidget(comparisonWidget);
+
     QVBoxLayout *consoleCardLayout = nullptr;
     QFrame *consoleCard = createCard("Processing output", consoleCardLayout);
     outputArea = new QTextEdit();
@@ -649,7 +681,10 @@ MainWindow::MainWindow(QWidget *parent)
                 browseBaselineButton->setVisible(checked);
             });
     connect(operationBox, &QComboBox::currentTextChanged,
-            this, &MainWindow::updateOperationFields);
+            this, [this](const QString &) {
+                comparisonWidget->setVisible(false);
+                updateOperationFields();
+            });
 
     // Create backend process
     backendProcess = new QProcess(this);
@@ -716,11 +751,15 @@ MainWindow::MainWindow(QWidget *parent)
                     statusLabel->setStyleSheet("color: #4ADE80; font-weight: 600;");
                     appendConsoleOutput("SUCCESS",
                                         operationBox->currentText() + " completed.");
+                    if (operationBox->currentText() == "Compress") {
+                        updateCompressionComparison();
+                    }
                 } else {
                     progressBar->setValue(0);
                     progressBar->setFormat("Failed");
                     statusLabel->setText("[ERROR] Operation failed; see output");
                     statusLabel->setStyleSheet("color: #F87171; font-weight: 600;");
+                    comparisonWidget->setVisible(false);
                 }
             });
 
@@ -940,9 +979,78 @@ void MainWindow::appendConsoleOutput(const QString &tag, const QString &text)
     outputArea->ensureCursorVisible();
 }
 
+void MainWindow::updateCompressionComparison()
+{
+    QString manifestName = chunksOutputName->text().trimmed();
+    if (QFileInfo(manifestName).suffix().isEmpty()) {
+        manifestName += ".json";
+    }
+    const QString manifestPath =
+        QDir(outputDirectory).filePath("collection/" + manifestName);
+    QFile manifestFile(manifestPath);
+    if (!manifestFile.open(QIODevice::ReadOnly)) {
+        appendConsoleOutput("ERROR", "Could not read the chunk manifest for size comparison.");
+        return;
+    }
+
+    const QJsonDocument document =
+        QJsonDocument::fromJson(manifestFile.readAll());
+    if (!document.isObject()) {
+        appendConsoleOutput("ERROR", "Chunk manifest is not valid JSON.");
+        return;
+    }
+
+    const QJsonObject compression =
+        document.object().value("selectiveCompression").toObject();
+    if (compression.isEmpty()) {
+        appendConsoleOutput("ERROR", "The chunk manifest has no compression metrics.");
+        return;
+    }
+
+    const quint64 originalBytes =
+        static_cast<quint64>(compression.value("totalSourceBytes").toDouble());
+    const quint64 payloadBytes =
+        static_cast<quint64>(compression.value("payloadBytes").toDouble());
+    const quint64 headerBytes =
+        static_cast<quint64>(compression.value("bundleHeaderBytes").toDouble());
+    quint64 packageBytes = payloadBytes + headerBytes;
+    if (packageBytes < payloadBytes) {
+        packageBytes = payloadBytes;
+    }
+
+    const quint64 savedBytes =
+        originalBytes > packageBytes ? originalBytes - packageBytes : 0;
+    const double savedPercent =
+        originalBytes == 0 ? 0.0
+                           : (100.0 * static_cast<double>(savedBytes)
+                              / static_cast<double>(originalBytes));
+
+    originalSizeLabel->setText(
+        "Original project: " + formatByteSize(originalBytes)
+        + " (" + QLocale().toString(originalBytes) + " bytes)");
+    payloadSizeLabel->setText(
+        "Transfer package: " + formatByteSize(packageBytes)
+        + " (" + QLocale().toString(packageBytes) + " bytes)");
+    sizeSavedLabel->setText(
+        "Size saved: " + formatByteSize(savedBytes)
+        + " (" + QString::number(savedPercent, 'f', 2) + "%)");
+    sizeSavedLabel->setStyleSheet("color: #4ADE80; font-weight: 600;");
+    comparisonWidget->setVisible(true);
+
+    appendConsoleOutput(
+        "SUCCESS",
+        "Size comparison: " + formatByteSize(originalBytes)
+        + " original -> " + formatByteSize(packageBytes)
+        + " package, " + formatByteSize(savedBytes)
+        + " saved (" + QString::number(savedPercent, 'f', 2) + "%)");
+}
+
 void MainWindow::updateOperationFields()
 {
     QString operation = operationBox->currentText();
+    if (operation != "Compress") {
+        comparisonWidget->setVisible(false);
+    }
     bool reconstruct = operation == "Reconstruct";
     bool compress = operation == "Compress";
     bool sending = operation == "Send to Receiver";
@@ -1022,6 +1130,8 @@ void MainWindow::updateOperationFields()
 
 void MainWindow::startTransfer()
 {
+    comparisonWidget->setVisible(false);
+
     if (networkWorker && networkWorker->isRunning()) {
         if (operationBox->currentText() == "Receive from Sender") {
             networkWorker->cancel();

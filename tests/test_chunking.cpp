@@ -735,8 +735,7 @@ static void test_selective_codec_compression() {
                 "Identical baseline chunk should be marked reusable");
     TEST_ASSERT(result.metrics.missingChunks == 2,
                 "Only the absent chunks should be written");
-    TEST_ASSERT(result.metrics.huffmanChunks + result.metrics.rleChunks +
-                    result.metrics.lzwChunks == 1,
+    TEST_ASSERT(result.metrics.huffmanChunks == 1,
                 "Compressible missing chunk should use a lossless codec");
     TEST_ASSERT(result.metrics.storedRawChunks == 1,
                 "Incompressible missing chunk should use raw storage");
@@ -762,18 +761,11 @@ static void test_selective_codec_compression() {
             TEST_ASSERT(huffmanDecompress(stored, chunk.metadata.length,
                                           decoded, error),
                         "Could not decode selected Huffman chunk");
-        } else if (chunk.codec == "rle") {
-            TEST_ASSERT(stored.size() % 2 == 0,
-                        "RLE output should contain count/value pairs");
-            for (size_t position = 0; position < stored.size(); position += 2) {
-                decoded.insert(decoded.end(), stored[position], stored[position + 1]);
-            }
         } else {
-            TEST_ASSERT(chunk.codec == "raw" || chunk.codec == "lzw",
+            TEST_ASSERT(chunk.codec == "raw",
                         "Unknown selected chunk codec");
             decoded = stored;
         }
-        if (chunk.codec == "lzw") continue;
         const std::vector<uint8_t>& expected =
             chunk.metadata.relativePath == "added.txt" ? added : noisy;
         TEST_ASSERT(decoded == expected,
@@ -828,87 +820,6 @@ static void test_selective_compression_deduplicates_current_chunks() {
                         result.metrics.payloadBytes -
                         result.metrics.bundleHeaderBytes,
                 "Total bytes avoided should account for bundle contents");
-}
-
-static void test_lzw_compression_reconstructs() {
-    setupTestDir();
-    fs::create_directories(TEST_DIR / "baseline");
-    fs::create_directories(TEST_DIR / "current");
-    fs::create_directories(TEST_DIR / "destination");
-
-    std::vector<uint8_t> pattern(256 * 64);
-    uint32_t randomState = 0x2468ace1;
-    std::vector<uint8_t> seed(256);
-    for (uint8_t& byte : seed) {
-        randomState ^= randomState << 13;
-        randomState ^= randomState >> 17;
-        randomState ^= randomState << 5;
-        byte = static_cast<uint8_t>(randomState & 0xff);
-    }
-    for (size_t index = 0; index < pattern.size(); ++index) {
-        pattern[index] = seed[index % seed.size()];
-    }
-    createTestFile("current/pattern.bin", pattern);
-
-    EngineConfig config;
-    config.strategy = ChunkStrategy::Fixed;
-    config.fixedConfig.chunkSize = pattern.size();
-    ChunkEngine engine(config);
-    ProjectScanner baselineScanner((TEST_DIR / "baseline").string());
-    ProjectScanner currentScanner((TEST_DIR / "current").string());
-    const ProjectChunkResult baseline = engine.processScannedProject(
-        baselineScanner.scan(), (TEST_DIR / "baseline").string());
-    const ProjectChunkResult current = engine.processScannedProject(
-        currentScanner.scan(), (TEST_DIR / "current").string());
-
-    const fs::path payloadPath = TEST_DIR / "lzw.rtpack";
-    CompressionResult compression;
-    std::string error;
-    CompressionEngine compressor;
-    TEST_ASSERT(compressor.compressMissingChunks(current, baseline,
-                                                 payloadPath.string(),
-                                                 compression, error),
-                "Could not compress LZW test data");
-    TEST_ASSERT(compression.metrics.lzwChunks == 1,
-                "Repeated byte patterns should select LZW");
-    TEST_ASSERT(compression.payloadChunks.size() == 1 &&
-                    compression.payloadChunks.front().codec == "lzw",
-                "LZW codec was not recorded in the chunk manifest");
-
-    const fs::path manifestPath = TEST_DIR / "lzw.json";
-    std::ofstream manifest(manifestPath);
-    const CompressedChunkInfo& packed = compression.payloadChunks.front();
-    const FileChunkResult& file = current.files.front();
-    const ChunkMetadata& chunk = file.chunks.front();
-    manifest << "{\"selectedStrategy\":\"fixed\","
-             << "\"selectiveCompression\":{\"payloadFile\":\"lzw.rtpack\","
-             << "\"payloadChunks\":[{\"fingerprint\":\""
-             << packed.metadata.fingerprint << "\",\"originalSize\":"
-             << packed.metadata.length << ",\"payloadOffset\":"
-             << packed.payloadOffset << ",\"storedSize\":" << packed.storedSize
-             << ",\"codec\":\"" << packed.codec << "\",\"crc32\":"
-             << packed.metadata.crc32 << "}]},\"files\":[{\"path\":\""
-             << file.relativePath << "\",\"size\":" << file.metrics.fileSize
-             << ",\"chunks\":[{\"seq\":" << chunk.sequenceNumber
-             << ",\"offset\":" << chunk.offset << ",\"length\":"
-             << chunk.length << ",\"fingerprint\":\"" << chunk.fingerprint
-             << "\",\"crc32\":" << chunk.crc32
-             << "}]}]}";
-    manifest.close();
-    TEST_ASSERT(manifest.good(), "Could not write LZW test manifest");
-
-    ReconstructionEngine reconstruction;
-    ReconstructionResult reconstructed;
-    TEST_ASSERT(reconstruction.reconstruct(
-                    manifestPath.string(), payloadPath.string(),
-                    (TEST_DIR / "destination").string(), reconstructed, error),
-                "Could not reconstruct LZW package: " + error);
-    std::ifstream output(TEST_DIR / "destination/pattern.bin", std::ios::binary);
-    std::vector<uint8_t> restored;
-    restored.assign(std::istreambuf_iterator<char>(output),
-                    std::istreambuf_iterator<char>());
-    TEST_ASSERT(restored == pattern,
-                "LZW reconstruction differs from its source bytes");
 }
 
 static void test_reconstruction_uses_payload_and_existing_chunks() {
@@ -1042,7 +953,6 @@ int main() {
     RUN_TEST(test_huffman_round_trip);
     RUN_TEST(test_selective_codec_compression);
     RUN_TEST(test_selective_compression_deduplicates_current_chunks);
-    RUN_TEST(test_lzw_compression_reconstructs);
     RUN_TEST(test_reconstruction_uses_payload_and_existing_chunks);
 
     cleanupTestDir();

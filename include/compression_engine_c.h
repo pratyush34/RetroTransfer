@@ -20,9 +20,7 @@ typedef struct {
 
 typedef enum {
     RT_CODEC_RAW = 0,
-    RT_CODEC_HUFFMAN = 1,
-    RT_CODEC_RLE = 2,
-    RT_CODEC_LZW = 3
+    RT_CODEC_HUFFMAN = 1
 } RtCompressionCodec;
 
 typedef struct {
@@ -38,8 +36,6 @@ typedef struct {
     size_t missing_chunks;
     size_t duplicate_chunks;
     size_t huffman_chunks;
-    size_t rle_chunks;
-    size_t lzw_chunks;
     size_t stored_raw_chunks;
     uint64_t reusable_bytes;
     uint64_t duplicate_bytes_avoided;

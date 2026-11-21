@@ -57,11 +57,15 @@ private:
     QLabel *payloadOutputLabel;
     QLabel *outputDirectoryLabel;
     QLabel *receiveAddressLabel;
+    QLabel *originalSizeLabel;
+    QLabel *payloadSizeLabel;
+    QLabel *sizeSavedLabel;
     QTextEdit *outputArea;
     QProgressBar *progressBar;
     QWidget *scanChunkWidget;
     QWidget *payloadOutputWidget;
     QWidget *compressionWidget;
+    QWidget *comparisonWidget;
     QWidget *reconstructionWidget;
     QWidget *destinationWidget;
     QWidget *networkSendWidget;
@@ -86,6 +90,7 @@ private:
     void updateOperationFields();
     void showSettingsDialog();
     void appendConsoleOutput(const QString &tag, const QString &text);
+    void updateCompressionComparison();
     void startTransfer();
     void startNetworkTransfer(bool receiving);
     void setOperationControlsEnabled(bool enabled);

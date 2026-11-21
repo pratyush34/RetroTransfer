@@ -257,14 +257,12 @@ static void writeChunkManifestJson(std::ofstream& out,
             << "\",\n";
         out << "    \"payloadFile\": \"" << jsonEscape(payloadName) << "\",\n";
         out << "    \"payloadFormat\": \"RTPK-v1\",\n";
-        out << "    \"codec\": \"smallest-of-rle-huffman-lzw-raw-per-chunk\",\n";
+        out << "    \"codec\": \"smallest-of-huffman-raw-per-chunk\",\n";
         out << "    \"totalChunks\": " << metrics.totalChunks << ",\n";
         out << "    \"reusableChunks\": " << metrics.reusableChunks << ",\n";
         out << "    \"missingChunks\": " << metrics.missingChunks << ",\n";
         out << "    \"duplicateChunks\": " << metrics.duplicateChunks << ",\n";
         out << "    \"huffmanChunks\": " << metrics.huffmanChunks << ",\n";
-        out << "    \"rleChunks\": " << metrics.rleChunks << ",\n";
-        out << "    \"lzwChunks\": " << metrics.lzwChunks << ",\n";
         out << "    \"rawChunks\": " << metrics.storedRawChunks << ",\n";
         out << "    \"reusableBytes\": " << metrics.reusableBytes << ",\n";
         out << "    \"duplicateBytesAvoided\": "
@@ -741,14 +739,30 @@ int runBackend(int argc, char* argv[]){
             std::cout << "Missing chunks     : " << metrics.missingChunks << "\n";
             std::cout << "Repeated missing   : " << metrics.duplicateChunks
                       << " (" << metrics.duplicateBytesAvoided << " bytes omitted)\n";
-            std::cout << "Huffman / RLE / LZW / raw: "
-                      << metrics.huffmanChunks << " / " << metrics.rleChunks
-                      << " / " << metrics.lzwChunks << " / "
+            std::cout << "Huffman / raw: "
+                      << metrics.huffmanChunks << " / "
                       << metrics.storedRawChunks << "\n";
             std::cout << "Compression saved  : "
                       << metrics.compressionBytesSaved << " bytes\n";
             std::cout << "Total bytes avoided: " << metrics.totalBytesAvoided
                       << " bytes\n";
+            const uint64_t bundleBytes =
+                metrics.payloadBytes + metrics.bundleHeaderBytes;
+            const uint64_t sizeSaved = metrics.totalSourceBytes > bundleBytes
+                ? metrics.totalSourceBytes - bundleBytes
+                : 0;
+            const double savedPercent = metrics.totalSourceBytes == 0
+                ? 0.0
+                : (100.0 * static_cast<double>(sizeSaved)
+                   / static_cast<double>(metrics.totalSourceBytes));
+            std::cout << "Original project   : "
+                      << metrics.totalSourceBytes << " bytes\n";
+            std::cout << "Transfer package   : "
+                      << bundleBytes << " bytes\n";
+            std::cout << "Size comparison    : "
+                      << sizeSaved << " bytes saved ("
+                      << std::fixed << std::setprecision(2)
+                      << savedPercent << "%)\n";
             std::cout << "Saved payload      : " << payloadOutputPath << "\n";
         }
 

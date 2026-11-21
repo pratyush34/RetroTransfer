@@ -20,8 +20,6 @@ struct CompressionMetrics {
     size_t missingChunks = 0;
     size_t duplicateChunks = 0;
     size_t huffmanChunks = 0;
-    size_t rleChunks = 0;
-    size_t lzwChunks = 0;
     size_t storedRawChunks = 0;
     uint64_t reusableBytes = 0;
     uint64_t duplicateBytesAvoided = 0;

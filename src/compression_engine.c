@@ -25,104 +25,11 @@
 
 #define RT_HEADER_SIZE UINT64_C(8)
 #define RT_MAX_CHUNK_SIZE_BYTES (UINT64_C(1024) * UINT64_C(1024) * UINT64_C(1024))
-#define RT_MAX_ALTERNATE_CODEC_INPUT_BYTES (UINT64_C(64) * UINT64_C(1024) * UINT64_C(1024))
-#define RT_LZW_DICTIONARY_SIZE 65536U
-#define RT_LZW_HASH_SIZE 131071U
-
 typedef struct {
     size_t *heads;
     size_t *next;
     size_t bucket_count;
 } ChunkIndex;
-
-typedef struct {
-    uint32_t key;
-    uint16_t code;
-    uint8_t occupied;
-} LzwEntry;
-
-static int rle_compress(const uint8_t *input, size_t input_size,
-                        uint8_t **output, size_t *output_size) {
-    *output = NULL;
-    *output_size = 0;
-    if (input_size == 0 || input_size > SIZE_MAX / 2) {
-        return 0;
-    }
-    uint8_t *encoded = (uint8_t *)malloc(input_size * 2);
-    if (encoded == NULL) {
-        return 0;
-    }
-
-    size_t input_position = 0;
-    size_t output_position = 0;
-    while (input_position < input_size) {
-        size_t run_length = 1;
-        while (run_length < 255 &&
-               run_length < input_size - input_position &&
-               input[input_position + run_length] == input[input_position]) {
-            ++run_length;
-        }
-        encoded[output_position++] = (uint8_t)run_length;
-        encoded[output_position++] = input[input_position];
-        input_position += run_length;
-    }
-    *output = encoded;
-    *output_size = output_position;
-    return 1;
-}
-
-static size_t lzw_find_slot(LzwEntry *table, uint32_t key) {
-    size_t slot = (size_t)((key * UINT32_C(2654435761)) % RT_LZW_HASH_SIZE);
-    while (table[slot].occupied && table[slot].key != key) {
-        slot = (slot + 1) % RT_LZW_HASH_SIZE;
-    }
-    return slot;
-}
-
-static int lzw_compress(const uint8_t *input, size_t input_size,
-                        uint8_t **output, size_t *output_size) {
-    *output = NULL;
-    *output_size = 0;
-    if (input_size == 0 || input_size > SIZE_MAX / 2) {
-        return 0;
-    }
-    LzwEntry *table = (LzwEntry *)calloc(RT_LZW_HASH_SIZE, sizeof(*table));
-    uint8_t *encoded = (uint8_t *)malloc(input_size * 2);
-    if (table == NULL || encoded == NULL) {
-        free(table);
-        free(encoded);
-        return 0;
-    }
-
-    uint32_t next_code = 256;
-    size_t output_position = 0;
-    uint16_t prefix = input[0];
-    for (size_t index = 1; index < input_size; ++index) {
-        const uint8_t next_byte = input[index];
-        const uint32_t key = ((uint32_t)prefix << 8) | next_byte;
-        const size_t slot = lzw_find_slot(table, key);
-        if (table[slot].occupied) {
-            prefix = table[slot].code;
-            continue;
-        }
-
-        encoded[output_position++] = (uint8_t)(prefix >> 8);
-        encoded[output_position++] = (uint8_t)(prefix & 0xff);
-        if (next_code < RT_LZW_DICTIONARY_SIZE) {
-            table[slot].occupied = 1;
-            table[slot].key = key;
-            table[slot].code = (uint16_t)next_code++;
-        }
-        prefix = next_byte;
-    }
-    encoded[output_position++] = (uint8_t)(prefix >> 8);
-    encoded[output_position++] = (uint8_t)(prefix & 0xff);
-    free(table);
-
-    *output = encoded;
-    *output_size = output_position;
-    return 1;
-}
 
 static void set_error(char *error, size_t capacity, const char *message) {
     if (error != NULL && capacity != 0) {
@@ -473,10 +380,6 @@ int rt_compress_missing_chunks(const RtCompressionChunk *current,
             goto cleanup;
         }
 
-        uint8_t *rle = NULL;
-        size_t rle_size = 0;
-        uint8_t *lzw = NULL;
-        size_t lzw_size = 0;
         RtCompressionCodec selected_codec = RT_CODEC_RAW;
         const uint8_t *payload = raw;
         size_t payload_size = raw_size;
@@ -484,20 +387,6 @@ int rt_compress_missing_chunks(const RtCompressionChunk *current,
             selected_codec = RT_CODEC_HUFFMAN;
             payload = huffman;
             payload_size = huffman_size;
-        }
-        if (raw_size <= RT_MAX_ALTERNATE_CODEC_INPUT_BYTES) {
-            if (rle_compress(raw, raw_size, &rle, &rle_size) &&
-                rle_size < payload_size) {
-                selected_codec = RT_CODEC_RLE;
-                payload = rle;
-                payload_size = rle_size;
-            }
-            if (lzw_compress(raw, raw_size, &lzw, &lzw_size) &&
-                lzw_size < payload_size) {
-                selected_codec = RT_CODEC_LZW;
-                payload = lzw;
-                payload_size = lzw_size;
-            }
         }
         RtCompressedChunk *compressed = &result->chunks[result->chunk_count];
         compressed->current_index = i;
@@ -507,8 +396,6 @@ int rt_compress_missing_chunks(const RtCompressionChunk *current,
             set_error_format(error, error_capacity,
                              "Failed writing compressed payload: %s", payload_path);
             free(huffman);
-            free(rle);
-            free(lzw);
             free(raw);
             goto cleanup;
         }
@@ -519,24 +406,16 @@ int rt_compress_missing_chunks(const RtCompressionChunk *current,
         if (!checked_add_u64(&result->metrics.unique_input_bytes, chunk->length) ||
             !checked_add_u64(&result->metrics.payload_bytes, payload_size)) {
             free(huffman);
-            free(rle);
-            free(lzw);
             free(raw);
             set_error(error, error_capacity, "Compression metrics overflow.");
             goto cleanup;
         }
         if (selected_codec == RT_CODEC_HUFFMAN) {
             ++result->metrics.huffman_chunks;
-        } else if (selected_codec == RT_CODEC_RLE) {
-            ++result->metrics.rle_chunks;
-        } else if (selected_codec == RT_CODEC_LZW) {
-            ++result->metrics.lzw_chunks;
         } else {
             ++result->metrics.stored_raw_chunks;
         }
         free(huffman);
-        free(rle);
-        free(lzw);
         free(raw);
     }
 

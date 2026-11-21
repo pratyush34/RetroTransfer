@@ -68,8 +68,6 @@ bool CompressionEngine::compressMissingChunks(const ProjectChunkResult& current,
     result.metrics.missingChunks = cResult.metrics.missing_chunks;
     result.metrics.duplicateChunks = cResult.metrics.duplicate_chunks;
     result.metrics.huffmanChunks = cResult.metrics.huffman_chunks;
-    result.metrics.rleChunks = cResult.metrics.rle_chunks;
-    result.metrics.lzwChunks = cResult.metrics.lzw_chunks;
     result.metrics.storedRawChunks = cResult.metrics.stored_raw_chunks;
     result.metrics.reusableBytes = cResult.metrics.reusable_bytes;
     result.metrics.duplicateBytesAvoided = cResult.metrics.duplicate_bytes_avoided;
@@ -90,12 +88,6 @@ bool CompressionEngine::compressMissingChunks(const ProjectChunkResult& current,
         switch (compressed.codec) {
         case RT_CODEC_HUFFMAN:
             info.codec = "huffman";
-            break;
-        case RT_CODEC_RLE:
-            info.codec = "rle";
-            break;
-        case RT_CODEC_LZW:
-            info.codec = "lzw";
             break;
         case RT_CODEC_RAW:
         default:
