@@ -730,14 +730,25 @@ bool runSender(const TcpTransferOptions &options,
         return false;
     }
 
-    summary = QString("Sent %1 new file bytes; %2 bytes were already present from a previous attempt.")
-                  .arg(static_cast<qulonglong>(sentBytes))
-                  .arg(static_cast<qulonglong>(scanOffset + manifestOffset +
-                                               payloadOffset));
-    return true;
-}
+    const quint64 resumedBytes = scanOffset + manifestOffset + payloadOffset;
 
-}
+    const double resumePercentage = total > 0
+        ? (static_cast<double>(resumedBytes) / total) * 100.0
+        : 0.0;
+
+    summary = QString(
+        "Transfer completed successfully!\n"
+        "New bytes transmitted: %1\n"
+        "Bytes resumed: %2\n"
+        "Resume efficiency: %3%"
+    )
+        .arg(static_cast<qulonglong>(sentBytes))
+        .arg(static_cast<qulonglong>(resumedBytes))
+        .arg(resumePercentage, 0, 'f', 2);
+
+    return true;
+
+}}
 
 TcpTransferWorker::TcpTransferWorker(
     const TcpTransferOptions &options, QObject *callbackContext,
