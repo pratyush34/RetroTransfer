@@ -1,5 +1,20 @@
 # RetroTransfer
 
+## Project Screenshots
+
+![RetroTransfer GitHub repository branch overview](docs/images/retrotransfer-repository-branches.jpg)
+
+*GitHub repository showing the available development branches.*
+
+![RetroTransfer application compression demonstration](docs/images/retrotransfer-compression-demo.jpg)
+
+*RetroTransfer application demonstrating adaptive chunking and compression results.*
+
+> [!NOTE]
+> The compression percentage and file-size results shown in the application demonstration are the result of that particular run, not a guaranteed performance figure.
+
+---
+
 ## Build and run on Windows
 
 The Windows build uses CMake, Ninja, the MSYS2 UCRT64 C/C++ toolchain, and Qt 6
